@@ -19,19 +19,19 @@ class Settings(BaseSettings):
 
     # GitHub Copilot
     github_token: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-    copilot_model: str = "claude-sonnet-4-5"
+    copilot_model: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 
     # Anthropic Claude
-    anthropic_api_key: str = ""
-    claude_model: str = "claude-sonnet-4-6"
+    anthropic_api_key: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    claude_model: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 
     # OpenAI
-    openai_api_key: str = ""
-    openai_model: str = "gpt-4o"
+    openai_api_key: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    openai_model: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 
     # Ollama
     ollama_base_url: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-    ollama_model: str = "deepseek-coder-v2"
+    ollama_model: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
     ollama_timeout: int = 120
 
     # GitLab
