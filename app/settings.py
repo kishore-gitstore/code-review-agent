@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     llm_provider: str = "ollama"
 
     # GitHub Copilot
-    github_token: str = "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"
+    github_token: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
     copilot_model: str = "claude-sonnet-4-5"
 
     # Anthropic Claude
@@ -30,14 +30,14 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o"
 
     # Ollama
-    ollama_base_url: str = "http://localhost:11434"
+    ollama_base_url: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
     ollama_model: str = "deepseek-coder-v2"
     ollama_timeout: int = 120
 
     # GitLab
-    gitlab_url: str = "http://172.29.242.215/osa/my-test-project"
-    gitlab_token: str = "y_AzUekz1A2tASaruTd-"
-    gitlab_webhook_secret: str = "supersecret12345"
+    gitlab_url: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    gitlab_token: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    gitlab_webhook_secret: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 
     # Agent behaviour
     max_diff_lines: int = 2000
