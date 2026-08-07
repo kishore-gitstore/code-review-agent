@@ -1,5 +1,23 @@
+import re
+
 from .base_agent import BaseAgent
 from app.utils.models import ReviewComment, Severity
+
+# Matches an assignment/annotation of a credential-looking name to a literal
+# string, e.g. `api_key = "sk-live-..."` — NOT a bare parameter name like
+# `def login(email, password):`, which merely mentioning "password" would
+# otherwise false-positive on.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)[\"']?\b(password|api[_-]?key|secret|token|access[_-]?key)\b[\"']?"
+    r"\s*(?::\s*\w+\s*)?[:=]\s*[\"'][^\"']{3,}[\"']"
+)
+
+# Matches a SQL statement built with string interpolation/concatenation on the
+# same line, e.g. an f-string `{var}` inside a SELECT, or `"... " + var`.
+_SQL_CONCAT_RE = re.compile(
+    r"(?i)\b(select|insert|update|delete)\b[^\n]*?(\{[^}]*\}|[\"']\s*\+|\+\s*[\"']|%s|\.format\()"
+)
+
 
 class SecurityAgent(BaseAgent):
     name = "security"
@@ -64,40 +82,47 @@ For each finding, state the CWE/OWASP reference, explain the exact attack scenar
 Respond ONLY with a JSON array as instructed.
 """.strip()
 
-    async def review(self, ctx, diff: str) -> list[ReviewComment]:
+    async def review(self, ctx, diff: str, static_findings=None, file_path=None, on_error=None) -> list[ReviewComment]:
         comments = []
+        fp = file_path or "unknown"
 
-        # --- Rule-based quick checks ---
-        if "eval(" in diff:
+        # Rule-based quick checks scan only added lines (diff "+" prefix stripped)
+        # so they look at real code, not unified-diff punctuation.
+        added_text = "\n".join(
+            line[1:] for line in diff.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+
+        if "eval(" in added_text:
             comments.append(ReviewComment(
                 agent=self.name,
                 title="Dangerous use of eval",
                 description="Eval on user input allows arbitrary code execution.",
                 severity=Severity.critical,
-                file_path="unknown",
+                file_path=fp,
                 line=None
             ))
 
-        if "password" in diff.lower() or "api_key" in diff.lower():
+        if _SECRET_ASSIGNMENT_RE.search(added_text):
             comments.append(ReviewComment(
                 agent=self.name,
                 title="Hardcoded secret",
-                description="Secrets should not be hardcoded in source code.",
+                description="A credential-looking variable is assigned a literal string. Secrets should not be hardcoded in source code.",
                 severity=Severity.high,
-                file_path="unknown",
+                file_path=fp,
                 line=None
             ))
 
-        if "SELECT * FROM" in diff and "+" in diff:
+        if _SQL_CONCAT_RE.search(added_text):
             comments.append(ReviewComment(
                 agent=self.name,
                 title="SQL injection risk",
-                description="Concatenating user input into SQL queries is unsafe.",
+                description="User input appears to be concatenated or interpolated directly into a SQL query.",
                 severity=Severity.critical,
-                file_path="unknown",
+                file_path=fp,
                 line=None
             ))
 
         # --- LLM analysis ---
-        llm_comments = await super().review(ctx, diff)
+        llm_comments = await super().review(ctx, diff, static_findings, fp, on_error=on_error)
         return comments + llm_comments

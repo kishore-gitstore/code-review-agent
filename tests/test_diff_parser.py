@@ -2,7 +2,7 @@
 tests/test_diff_parser.py — Unit tests for the diff parser utility
 """
 
-from app.utils.diff_parser import parse_diff, get_changed_files, get_path_map
+from app.utils.diff_parser import parse_diff, get_changed_files, get_path_map, get_changed_line_map
 
 SAMPLE_DIFF = """diff --git a/app/main.py b/app/main.py
 index abc..def 100644
@@ -76,3 +76,20 @@ rename to new_name.py
 def test_get_path_map_rename():
     path_map = get_path_map(RENAME_DIFF)
     assert path_map["new_name.py"] == "old_name.py"
+
+
+def test_changed_lines_excludes_context_and_removed_lines():
+    """Only new-file lines actually added by the diff — not surrounding
+    unchanged context, and not old lines that no longer exist — so static
+    analysis findings can be scoped to just what this diff touches."""
+    files = parse_diff(SAMPLE_DIFF)
+    main_file = next(f for f in files if f.path == "app/main.py")
+    # "import sys" (line 2), "print(hello world)" (line 5), "return 0" (line 6).
+    # NOT line 1 (unchanged "import os") or the removed old print() line.
+    assert main_file.changed_lines == {2, 5, 6}
+
+
+def test_get_changed_line_map():
+    line_map = get_changed_line_map(SAMPLE_DIFF)
+    assert line_map["app/main.py"] == {2, 5, 6}
+    assert line_map["README.md"] == {2}

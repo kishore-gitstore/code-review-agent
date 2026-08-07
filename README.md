@@ -13,6 +13,22 @@ GitLab MR Opened/Updated
   Webhook → FastAPI Server
         │
         ▼
+  Shallow clone of MR source branch (Source Code)
+        │
+        ▼
+  Language Detector  ──────────────────────────────────────┐
+        │                                                  │
+        ▼                                                  │
+  Roslyn (C#) · ESLint (JS/TS) · Ruff (Python)              │
+  Clippy (Rust) · Clang-Tidy (C/C++) · SpotBugs (Java)      │
+        │                                                  │
+        ▼                                                  │
+  Static Analysis Results                                   │
+        │                                                  │
+        ▼                                                  │
+  LLM Prompt (diff + static findings) ◄─────────────────────┘
+        │
+        ▼
   CoordinatorAgent
   ├── CodeQualityAgent   → bugs, logic errors, smells
   ├── SecurityAgent      → OWASP Top 10, secrets, injection
@@ -20,7 +36,10 @@ GitLab MR Opened/Updated
   └── DocumentationAgent → missing docstrings, outdated comments
         │
         ▼
-  Deduplicate + Prioritise
+  Ollama (local LLM) → AI Review
+        │
+        ▼
+  Merge Results (static findings + AI review) → Deduplicate + Prioritise
         │
         ▼
   LLM Summary Generation
@@ -28,6 +47,21 @@ GitLab MR Opened/Updated
         ▼
   Post inline + summary comments → GitLab MR
 ```
+
+Static analysis runs per changed file based on its detected language, and its
+findings are (a) merged directly into the final results and (b) injected into
+each specialist agent's LLM prompt so the model doesn't re-report what a linter
+already caught. If the MR source branch can't be cloned (no `git`, network
+issue, etc.) the pipeline degrades gracefully to LLM-only review — nothing
+fails, that stage is just skipped. See [Static Analysis Tools](#static-analysis-tools) below.
+
+**Diff-scoped, not whole-file.** Linters run against each changed file's
+current full content on disk (they need real, complete source to parse), but
+the coordinator then drops any finding that isn't on a line the diff actually
+added — so a pre-existing issue elsewhere in a touched file won't show up as
+if this MR introduced it. File-level findings (no specific line) are always
+kept. This matches how the LLM agents already behave, since they only ever see
+the diff chunk, never the whole file.
 
 ---
 
@@ -38,6 +72,99 @@ GitLab MR Opened/Updated
 | Python | ≥ 3.12   | Runtime                      |
 | Ollama | latest   | Local LLM runner             |
 | Docker | optional | Containerised deployment     |
+| git    | any      | Clones the MR branch for static analysis |
+
+---
+
+## Static Analysis Tools
+
+Each is optional and independent — install only the ones matching languages you
+review. A missing tool is logged and skipped; the LLM-only review still runs.
+
+| Language        | Tool     | Install                                              | Config (`.env`) |
+|-----------------|----------|-------------------------------------------------------|-----------------|
+| C#              | Roslyn (via `dotnet format`) | Ships with the [.NET SDK](https://dotnet.microsoft.com/download) | `DOTNET_CMD` |
+| JS / TS         | ESLint   | `npm install -g eslint` (or a local `eslintrc` + `node_modules/.bin/eslint`) | `ESLINT_CMD` |
+| Python          | Ruff     | `pip install ruff`                                     | `RUFF_CMD` |
+| Rust            | Clippy   | `rustup component add clippy`                          | `CARGO_CMD` |
+| C / C++         | Clang-Tidy | `apt install clang-tidy` / `brew install llvm`       | `CLANG_TIDY_CMD`, `CLANG_TIDY_ARGS` |
+| Java            | SpotBugs | `apt install spotbugs` or download from [spotbugs.github.io](https://spotbugs.github.io/) | `SPOTBUGS_CMD`, `SPOTBUGS_CLASSES_DIRS` |
+
+Set `ENABLE_STATIC_ANALYSIS=false` to disable the whole stage, or
+`CLONE_FOR_STATIC_ANALYSIS=false` to keep it LLM-diff-only without ever cloning
+the repo (useful if the server can't reach your GitLab host over git).
+
+Adding a new language is a plugin, not a review-engine change: subclass
+`StaticAnalyzer` in `app/static_analysis/`, decorate the class with
+`@register_analyzer(Language.whatever)`, and import the module from
+`app/static_analysis/__init__.py`. `StaticAnalysisRunner` reads the registry
+(`app/static_analysis/registry.py`) rather than knowing about any specific
+tool, so nothing else needs to change.
+
+### Clang-Tidy notes
+
+Clang-Tidy needs to resolve `#include`s to do anything beyond the most
+trivial syntax checks, which normally means a compilation database
+(`compile_commands.json`, produced by CMake/Bazel/`bear`/`compiledb`). If one
+exists anywhere under the checkout, it's picked up automatically (`-p
+<dir>`); otherwise `CLANG_TIDY_ARGS` (default `-- -std=c++17`) is passed as a
+fallback so at least syntax-only checks still run. Point `CLANG_TIDY_ARGS` at
+your own flags if the fallback misses too much for your codebase.
+
+### SpotBugs notes
+
+Unlike the other analyzers, SpotBugs analyzes compiled **bytecode**, not
+source — the project must already be built (Maven's `target/classes`,
+Gradle's `build/classes/java/main`, or another directory listed in
+`SPOTBUGS_CLASSES_DIRS`). This analyzer does not compile the project itself
+(a real Java classpath depends on external dependencies with no visibility
+from here), so if none of the configured directories exist under the
+checkout, it reports itself unavailable — `mvn compile` / `gradle
+compileJava` before running a review that touches Java files.
+
+### C# / Roslyn notes
+
+Roslyn/MSBuild need a project to resolve anything, so this analyzer prefers
+the nearest real `.sln`/`.slnx`/`.csproj` under the checkout. If the checkout
+only has the changed file(s) — e.g. static analysis fell back to fetching
+just the changed files via the GitLab API instead of a full `git clone` — it
+synthesizes a minimal throwaway project around just those files instead of
+reporting itself unavailable. That throwaway project only sees the changed
+files, so it won't catch cross-file issues a real project/full clone would;
+install `git` on the server for the more accurate path.
+
+The synthesized project's target framework is auto-detected from `dotnet
+--version` (e.g. dotnet 10 installed → targets `net10.0`), so no manual
+configuration is needed when you install a different SDK version.
+
+Also note: `dotnet format analyzers` silently reports zero findings when
+pointed directly at a bare `.csproj` with no solution — confirmed against a
+real dotnet 10 SDK, it logs `Skipping referenced project '<name>'` even
+though `dotnet build` reports the exact same warnings fine. Every `.csproj`
+this analyzer touches, real or synthesized, is therefore wrapped in a
+throwaway solution file before running `dotnet format`.
+
+---
+
+## Execution Mode (CPU / GPU)
+
+On startup, the server detects the CPU core count, total RAM, whether an
+NVIDIA GPU is present (via `nvidia-smi`), and whether Ollama is actually
+using it for the configured model (via `/api/ps`) — all logged as a single
+`hardware.detected` line. `EXECUTION_MODE` then resolves to a concrete
+concurrency policy:
+
+| Mode   | Behaviour |
+|--------|-----------|
+| `auto` (default) | Picks `gpu` if a GPU was detected, else `cpu` |
+| `cpu`  | Forces everything below to run **one at a time** — MR reviews, static analyzers, LLM requests — regardless of the `MAX_PARALLEL_*` values. A CPU-only box can't truly parallelise any of these, so this is a hard floor, not a default you can override upward by mistake. |
+| `gpu`  | Uses `MAX_PARALLEL_REVIEWS` / `MAX_PARALLEL_ANALYZERS` / `MAX_PARALLEL_LLM_REQUESTS` as configured, gated with `asyncio.Semaphore` at each layer (concurrent MR reviews, concurrent static-analysis language groups, concurrent LLM requests). |
+
+The resolved policy is logged once at startup as `execution.mode_resolved`.
+If you're on a GPU box but reviews still run one at a time, check that log
+line — `auto` only picks `gpu` if `nvidia-smi` actually reports a GPU;
+force it explicitly with `EXECUTION_MODE=gpu` if detection is wrong for your
+setup (e.g. a non-NVIDIA GPU).
 
 ---
 
@@ -53,6 +180,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull deepseek-coder-v2      # recommended — 16GB RAM
 ollama pull deepseek-r1:7b         # lighter — 8GB RAM
 ollama pull codellama:13b          # alternative
+ollama pull qwen3-coder:latest     # newest Qwen coder release, strong agentic coding
 ```
 
 ### 2. Clone & configure
@@ -87,6 +215,52 @@ python main.py
 3. Set Secret Token: (same as `GITLAB_WEBHOOK_SECRET` in `.env`)
 4. Enable trigger: ✅ **Merge request events**
 5. Click **Add webhook**
+
+---
+
+## Run as a systemd Service (Linux)
+
+For a persistent deployment that survives SSH disconnects, crashes, and
+reboots, instead of running `./run.sh` in a terminal:
+
+```bash
+# 1. Run it once by hand first — creates the venv and confirms it starts.
+./run.sh
+# Ctrl+C once you see "Application startup complete."
+
+# 2. Install + start the service (fills in User/WorkingDirectory automatically
+#    from this machine — no manual editing of code-review-agent.service needed)
+sudo ./install-service.sh
+
+# 3. Check status / logs
+sudo systemctl status code-review-agent
+journalctl -u code-review-agent -f
+```
+
+`code-review-agent.service` is a template (`__SERVICE_USER__`/`__WORKDIR__`
+placeholders) — `install-service.sh` fills those in from the invoking user
+and script location, writes the result to `/etc/systemd/system/`, then runs
+`daemon-reload` and `enable --now`.
+
+The unit runs `main.py` directly (not `run.sh`) so it doesn't re-run `pip
+install` on every restart, and it runs with `UVICORN_RELOAD` unset —
+`run.sh` enables uvicorn's auto-reload for interactive dev use, but a
+service shouldn't re-exec itself on every file touch, so the unit stays in
+stable no-reload mode. It's configured to start on boot and to restart
+automatically 60 seconds after it stops for any reason other than an
+explicit `systemctl stop` (`Restart=always`, `RestartSec=60`,
+`StartLimitIntervalSec=0` — never gives up retrying). To pick up a code
+change, `sudo systemctl restart code-review-agent`.
+
+**Uninstall:**
+
+```bash
+sudo ./uninstall-service.sh
+```
+
+Stops and disables the service and removes the unit file from
+`/etc/systemd/system/` — leaves the venv, `.env`, and the rest of the repo
+untouched.
 
 ---
 
@@ -139,7 +313,11 @@ curl -X POST http://localhost:8000/review \
 |---------------------------|-----------------------------|------------------------------------------|
 | `OLLAMA_BASE_URL`         | `http://localhost:11434`    | Ollama API URL                           |
 | `OLLAMA_MODEL`            | `deepseek-coder-v2`         | Model name (must be pulled first)        |
-| `OLLAMA_TIMEOUT`          | `120`                       | Seconds before LLM call times out       |
+| `OLLAMA_TIMEOUT`          | `300`                       | Seconds before an LLM call times out — raise this if you see `ReadTimeout`/`RetryError` in the logs, larger local coder models can easily take minutes per request |
+| `EXECUTION_MODE`          | `auto`                      | `auto` \| `cpu` \| `gpu` — see [Execution Mode](#execution-mode-cpu--gpu) above |
+| `MAX_PARALLEL_REVIEWS`    | `1`                         | Concurrent MR reviews end-to-end (gpu/cloud mode only — forced to 1 in cpu mode) |
+| `MAX_PARALLEL_ANALYZERS`  | `1`                         | Concurrent static-analysis language groups (gpu/cloud mode only — forced to 1 in cpu mode) |
+| `MAX_PARALLEL_LLM_REQUESTS` | `1`                       | Concurrent LLM requests, across agents and MRs (gpu/cloud mode only — forced to 1 in cpu mode) |
 | `GITLAB_URL`              | `https://gitlab.com`        | Your GitLab instance URL                 |
 | `GITLAB_TOKEN`            | —                           | Personal/Project access token (**required**) |
 | `GITLAB_WEBHOOK_SECRET`   | —                           | Webhook secret for signature verification|
@@ -151,6 +329,17 @@ curl -X POST http://localhost:8000/review \
 | `ENABLE_SECURITY`         | `true`                      | Toggle Security agent                    |
 | `ENABLE_PERFORMANCE`      | `true`                      | Toggle Performance agent                 |
 | `ENABLE_DOCUMENTATION`    | `true`                      | Toggle Documentation agent               |
+| `ENABLE_STATIC_ANALYSIS`  | `true`                      | Toggle the static analysis stage         |
+| `CLONE_FOR_STATIC_ANALYSIS` | `true`                   | Shallow-clone the MR branch so analyzers have real files |
+| `STATIC_ANALYSIS_TIMEOUT` | `60`                        | Seconds before a static analyzer subprocess is killed |
+| `DOTNET_CMD`              | `dotnet`                    | Roslyn (C#) — binary name or full path   |
+| `ESLINT_CMD`              | `eslint`                    | ESLint (JS/TS) — binary name or full path|
+| `RUFF_CMD`                | `ruff`                      | Ruff (Python) — binary name or full path |
+| `CARGO_CMD`               | `cargo`                     | Clippy (Rust) — binary name or full path |
+| `CLANG_TIDY_CMD`          | `clang-tidy`                | Clang-Tidy (C/C++) — binary name or full path |
+| `CLANG_TIDY_ARGS`         | `-- -std=c++17`              | Fallback compiler flags used only when no `compile_commands.json` is found under the checkout |
+| `SPOTBUGS_CMD`            | `spotbugs`                  | SpotBugs (Java) — binary name or full path |
+| `SPOTBUGS_CLASSES_DIRS`   | `target/classes,build/classes/java/main` | Comma-separated candidate build-output directories, checked in order; first one that exists is used |
 
 ---
 
@@ -171,8 +360,43 @@ pytest tests/ -v
 | `deepseek-r1:14b`      | 16 GB      | Better accuracy                 |
 | `codellama:13b`        | 16 GB      | Alternative open-source option  |
 | `qwen2.5-coder:14b`    | 16 GB      | Strong competitor to DeepSeek   |
+| `qwen3-coder:latest`   | ~20 GB     | Newest Qwen coder release (MoE), strong agentic/tool-use coding |
 
 Change the model anytime by updating `OLLAMA_MODEL` in `.env` and restarting.
+
+### Troubleshooting: agents keep timing out (`RetryError`/`ReadTimeout` in logs)
+
+The 4 specialist agents (code quality, security, performance, documentation)
+default to running **strictly one at a time** in `cpu` execution mode
+specifically because a typical single-GPU/CPU Ollama instance only processes
+one generation at a time — firing requests concurrently just makes them
+queue on Ollama's side while each one's own client-side timeout clock is
+already running, so it can time out before Ollama even starts on it.
+Symptoms if this ever regresses: 3 of 4 agents return 0 findings and log
+`RetryError[...ReadTimeout]`, while only rule-based (non-LLM) findings ever
+show up — e.g. the review always reports exactly the same 2 issues
+regardless of what changed.
+
+**Verify it's actually taking effect:** look for the `execution.mode_resolved`
+log line at startup — it includes `resolved=` and `max_parallel_llm_requests=`.
+If `resolved` is `gpu` on a box that can't actually parallelise Ollama
+generation, either hardware detection found a GPU that Ollama isn't using
+for this model (check `ollama_using_gpu` in the `hardware.detected` log line)
+or `EXECUTION_MODE` is explicitly forced to `gpu` in `.env` — set it to `cpu`
+to force serial execution regardless of detection. Also check
+`coordinator.start`'s `agent_concurrency=` field matches. The process needs a
+full restart after any `.env` change — `uvicorn --reload` watches `*.py`
+changes, not env files.
+
+If agents are confirmed running one at a time and a *specific* one (often
+`code_quality` or `security` — they have the longest system prompts) still
+times out, its prompt is simply taking longer than `OLLAMA_TIMEOUT` to
+generate on your hardware — raise `OLLAMA_TIMEOUT` further (600+ for CPU-only
+inference of larger coder models).
+
+If you have spare GPU/cloud capacity and want agents running concurrently
+again, set `EXECUTION_MODE=gpu` (or leave `auto` if detection finds your GPU)
+and raise `MAX_PARALLEL_LLM_REQUESTS` accordingly.
 
 ---
 
@@ -185,10 +409,8 @@ code-review-agent/
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
-├── config/
-│   ├── __init__.py
-│   └── settings.py                # Pydantic settings
 ├── app/
+│   ├── settings.py                # Pydantic settings (reads .env)
 │   ├── server.py                  # FastAPI app + webhook handler
 │   ├── agents/
 │   │   ├── base_agent.py          # Abstract base + JSON parser
@@ -200,14 +422,33 @@ code-review-agent/
 │   ├── llm/
 │   │   └── ollama_client.py       # Async Ollama wrapper
 │   ├── gitlab/
-│   │   └── client.py              # GitLab API client
+│   │   └── client.py              # GitLab API client + MR branch clone
+│   ├── execution/
+│   │   ├── hardware.py            # CPU/RAM/GPU + Ollama-GPU-usage detection
+│   │   └── policy.py              # Resolves EXECUTION_MODE -> ExecutionPolicy
+│   ├── static_analysis/
+│   │   ├── language_detector.py   # File extension -> Language
+│   │   ├── base_analyzer.py       # StaticAnalyzer plugin interface
+│   │   ├── diagnostics.py         # DiagnosticIssue common model
+│   │   ├── registry.py            # Language -> analyzer class plugin registry
+│   │   ├── roslyn_analyzer.py     # C# (via `dotnet format analyzers`)
+│   │   ├── eslint_analyzer.py     # JS / TS
+│   │   ├── ruff_analyzer.py       # Python
+│   │   ├── clippy_analyzer.py     # Rust
+│   │   ├── clang_tidy_analyzer.py # C / C++
+│   │   ├── spotbugs_analyzer.py   # Java
+│   │   └── runner.py              # Dispatches by language, merges results
 │   └── utils/
 │       ├── models.py              # Pydantic data models
-│       └── diff_parser.py         # Unified diff parser
+│       ├── diff_parser.py         # Unified diff parser
+│       └── process_runner.py      # Shared async subprocess runner (analyzers + hardware detection)
 ├── tests/
 │   ├── test_agents.py
 │   ├── test_coordinator.py
-│   └── test_diff_parser.py
-└── scripts/
-    └── review_local.py            # CLI for local testing
+│   ├── test_diff_parser.py
+│   ├── test_static_analysis.py
+│   ├── test_ollama_client.py
+│   ├── test_execution.py
+│   ├── test_process_runner.py
+│   └── review_local.py            # CLI for local testing
 ```

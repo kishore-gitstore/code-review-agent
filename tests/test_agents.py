@@ -91,15 +91,60 @@ def test_parse_invalid_json():
     assert result == []
 
 
+def test_parse_prefers_known_file_path_over_llm_guess():
+    """Each review() call is scoped to one file's diff, so the caller-supplied
+    file_path must win even if the LLM's JSON omits it or gets it wrong —
+    otherwise findings show up as 'unknown' location in the posted review."""
+    agent  = ConcreteAgent()
+    raw    = json.dumps([{**SAMPLE_FINDINGS[0], "file_path": "wrong/path.py"}])
+    result = agent._parse(raw, file_path="app/auth.py")
+    assert result[0].file_path == "app/auth.py"
+
+
+def test_parse_falls_back_to_llm_file_path_when_none_known():
+    agent  = ConcreteAgent()
+    result = agent._parse(json.dumps(SAMPLE_FINDINGS), file_path=None)
+    assert result[0].file_path == "app/auth.py"
+
+
 # ── Agent integration (mocked LLM) ───────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_security_agent(mock_ollama):
     agent   = SecurityAgent()
     results = await agent.review(SAMPLE_CTX, SAMPLE_CTX.diff)
-    assert len(results) == 1
-    assert results[0].agent == "security"
-    assert results[0].severity == Severity.critical
+    # rule-based SQL-injection catch (f-string interpolation inside a SELECT)
+    # + the mocked LLM finding — 'password' is just a parameter name here,
+    # so it must NOT also trigger the hardcoded-secret rule (see below).
+    assert len(results) == 2
+    assert all(r.agent == "security" for r in results)
+    assert all(r.severity == Severity.critical for r in results)
+
+
+@pytest.mark.asyncio
+async def test_security_agent_no_false_positive_on_param_name(mock_ollama):
+    """A function parameter literally named `password` must not trigger the
+    hardcoded-secret rule — only an assignment to a string literal should."""
+    agent   = SecurityAgent()
+    results = await agent.review(SAMPLE_CTX, SAMPLE_CTX.diff)
+    assert not any(r.title == "Hardcoded secret" for r in results)
+
+
+@pytest.mark.asyncio
+async def test_security_agent_detects_real_hardcoded_secret(mock_ollama):
+    ctx = SAMPLE_CTX.model_copy(update={"diff": (
+        "diff --git a/app/config.py b/app/config.py\n"
+        "+API_KEY = \"sk-live-1234567890abcdef\"\n"
+    )})
+    agent   = SecurityAgent()
+    results = await agent.review(ctx, ctx.diff)
+    assert any(r.title == "Hardcoded secret" for r in results)
+
+
+@pytest.mark.asyncio
+async def test_security_agent_uses_passed_file_path(mock_ollama):
+    results = await SecurityAgent().review(SAMPLE_CTX, SAMPLE_CTX.diff, file_path="app/auth.py")
+    assert all(r.file_path == "app/auth.py" for r in results)
 
 
 @pytest.mark.asyncio

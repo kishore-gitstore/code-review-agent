@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Code Review Agent — Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #2a2e37;
+    --text: #e6e8eb; --muted: #8b93a1;
+    --red: #e5484d; --yellow: #e5a72d; --green: #3dd68c; --blue: #5b9dff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f6f8; --panel: #ffffff; --border: #dfe3e8;
+      --text: #1b1f27; --muted: #5b6472;
+      --red: #d1332f; --yellow: #a86a00; --green: #157a4f; --blue: #1f5fd1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  input[type=text] {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 7px 10px; border-radius: 6px; font-size: 13px; min-width: 220px;
+  }
+  select {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 7px 10px; border-radius: 6px; font-size: 13px;
+  }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  .muted { color: var(--muted); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border);
+    white-space: nowrap; font-size: 13px;
+  }
+  th {
+    position: sticky; top: 0; background: var(--panel); color: var(--muted);
+    font-weight: 600; cursor: pointer; user-select: none;
+  }
+  th:hover { color: var(--text); }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: rgba(91, 157, 255, 0.08); }
+  tbody tr.live-row { background: rgba(91, 157, 255, 0.06); }
+  tbody tr.live-row:hover { background: rgba(91, 157, 255, 0.14); }
+  .badge {
+    display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+    font-weight: 600; border: 1px solid currentColor;
+  }
+  .badge.success { color: var(--green); }
+  .badge.failed  { color: var(--red); }
+  .badge.running { color: var(--blue); }
+  .sev { font-size: 11px; padding: 0 4px; border-radius: 4px; margin-right: 3px; }
+  .sev.crit { background: var(--red); color: #fff; }
+  .sev.high { background: var(--red); color: #fff; opacity: .75; }
+  .sev.med  { background: var(--yellow); color: #1b1f27; }
+  .sev.low  { background: var(--green); color: #1b1f27; }
+  #empty { padding: 40px; text-align: center; color: var(--muted); }
+  #detail {
+    display: none; margin-top: 16px; padding: 16px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 10px;
+  }
+  #detail h2 { font-size: 14px; margin: 0 0 10px; }
+  #detail table { font-size: 12px; }
+  #detail .close { float: right; cursor: pointer; color: var(--muted); }
+  #detail .close:hover { color: var(--text); }
+</style>
+</head>
+<body>
+  <h1>🤖 Code Review Agent — Dashboard</h1>
+  <p class="sub" id="summary-line">Loading…</p>
+
+  <div class="toolbar">
+    <input type="text" id="filter" placeholder="Filter by project, MR, or branch…">
+    <select id="status-filter">
+      <option value="">All statuses</option>
+      <option value="success">Success</option>
+      <option value="failed">Failed</option>
+      <option value="running">Running</option>
+    </select>
+    <span class="muted" id="refresh-note">auto-refreshing every 10s</span>
+  </div>
+
+  <div class="panel">
+    <table id="table">
+      <thead>
+        <tr>
+          <th data-key="project_id">Project</th>
+          <th data-key="mr_iid">MR</th>
+          <th data-key="branch">Branch</th>
+          <th data-key="model">Model</th>
+          <th data-key="status">Status</th>
+          <th data-key="started_at">Started</th>
+          <th data-key="total_duration_s">Duration</th>
+          <th data-key="total_issues">Issues</th>
+          <th data-key="llm_requests_total">LLM Reqs</th>
+          <th data-key="static_analyzers_run">Analyzers</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty" style="display:none">No reports yet — run a review to see it here.</div>
+  </div>
+
+  <div id="detail">
+    <span class="close" onclick="closeDetail()">✕ close</span>
+    <h2 id="detail-title"></h2>
+    <div id="detail-body"></div>
+  </div>
+
+<script>
+let reports = [];
+let sortKey = "started_at";
+let sortDir = -1;
+
+function fmtDuration(s) {
+  if (s == null) return "-";
+  const totalMs = Math.round(s * 1000);
+  const h = Math.floor(totalMs / 3600000);
+  const m = Math.floor((totalMs % 3600000) / 60000);
+  const sec = Math.floor((totalMs % 60000) / 1000);
+  const ms = totalMs % 1000;
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}.${String(ms).padStart(3,"0")}`;
+}
+
+function fmtTime(iso) {
+  if (!iso) return "-";
+  return iso.replace("T", " ").slice(0, 19);
+}
+
+function statusBadge(r) {
+  const status = typeof r === "string" ? r : r.status;
+  const cls = status === "success" ? "success" : status === "failed" || status === "error" ? "failed" : "running";
+  const label = status === "error" ? "failed" : status;
+  let html = `<span class="badge ${cls}">${label}</span>`;
+  if (typeof r === "object" && r._live) {
+    html += ` <span class="muted">${r.agents_done.length}/${r.agents_total} agents</span>`;
+  }
+  return html;
+}
+
+function severityBadges(r) {
+  if (r._live) return `<span class="muted">…</span>`;
+  const parts = [];
+  if (r.critical_count) parts.push(`<span class="sev crit">${r.critical_count}C</span>`);
+  if (r.high_count)     parts.push(`<span class="sev high">${r.high_count}H</span>`);
+  if (r.medium_count)   parts.push(`<span class="sev med">${r.medium_count}M</span>`);
+  if (r.low_count)      parts.push(`<span class="sev low">${r.low_count}L</span>`);
+  return parts.length ? parts.join("") : `<span class="muted">0</span>`;
+}
+
+function liveDuration(r) {
+  const started = Date.parse(r.started_at);
+  if (isNaN(started)) return null;
+  return (Date.now() - started) / 1000;
+}
+
+function applyFilters(list) {
+  const q = document.getElementById("filter").value.trim().toLowerCase();
+  const statusFilter = document.getElementById("status-filter").value;
+  return list.filter(r => {
+    if (statusFilter && r.status !== statusFilter) return false;
+    if (!q) return true;
+    const hay = `${r.project_id ?? ""} ${r.project_name ?? ""} ${r.mr_iid ?? ""} ${r.branch ?? ""} ${r.repository ?? ""}`.toLowerCase();
+    return hay.includes(q);
+  });
+}
+
+function render() {
+  const rows = document.getElementById("rows");
+  const empty = document.getElementById("empty");
+  let list = applyFilters(reports);
+  list.sort((a, b) => {
+    const av = a[sortKey], bv = b[sortKey];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    return av < bv ? -sortDir : av > bv ? sortDir : 0;
+  });
+
+  rows.innerHTML = "";
+  empty.style.display = list.length ? "none" : "block";
+
+  for (const r of list) {
+    const tr = document.createElement("tr");
+    if (r._live) tr.classList.add("live-row");
+    const projectCell = r.project_name
+      ? `${r.project_name} <span class="muted">(${r.project_id ?? "-"})</span>`
+      : (r.project_id ?? "-");
+    const duration = r._live ? liveDuration(r) : r.total_duration_s;
+    tr.innerHTML = `
+      <td>${projectCell}</td>
+      <td>${r.mr_iid != null ? "!" + r.mr_iid : "-"}</td>
+      <td>${r.branch || "<span class=\"muted\">-</span>"}</td>
+      <td class="muted">${r.model ?? "-"}</td>
+      <td>${statusBadge(r)}</td>
+      <td>${fmtTime(r.started_at)}</td>
+      <td>${fmtDuration(duration)}</td>
+      <td>${severityBadges(r)}</td>
+      <td>${r._live ? '<span class="muted">-</span>' : (r.llm_requests_total ?? 0)}</td>
+      <td>${r._live ? '<span class="muted">-</span>' : (r.static_analyzers_run ?? 0)}</td>
+    `;
+    tr.onclick = () => r._live ? openLiveDetail(r.project_id, r.mr_iid) : openDetail(r._file);
+    rows.appendChild(tr);
+  }
+
+  const liveCount = reports.filter(r => r._live).length;
+  const total = reports.length - liveCount;
+  const failed = reports.filter(r => r.status === "failed").length;
+  document.getElementById("summary-line").textContent =
+    `${liveCount} running — ${total} report(s) — ${failed} failed — showing ${list.length}`;
+}
+
+async function refresh() {
+  try {
+    const [reportsRes, activeRes] = await Promise.all([
+      fetch("/api/reports?limit=200"),
+      fetch("/review/active"),
+    ]);
+    const finished = await reportsRes.json();
+    const active = activeRes.ok ? await activeRes.json() : [];
+    const running = active
+      .filter(a => a.status === "running")
+      .map(a => ({ ...a, _live: true }));
+    reports = [...running, ...finished];
+    render();
+  } catch (e) {
+    document.getElementById("summary-line").textContent = "Failed to load reports: " + e;
+  }
+}
+
+async function openDetail(filename) {
+  const panel = document.getElementById("detail");
+  const body = document.getElementById("detail-body");
+  document.getElementById("detail-title").textContent = filename;
+  panel.style.display = "block";
+  body.innerHTML = "Loading…";
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+  const res = await fetch(`/api/reports/${encodeURIComponent(filename)}`);
+  if (!res.ok) { body.innerHTML = "Could not load this report."; return; }
+  const d = await res.json();
+
+  let llmRows = (d.llm_requests || []).map((r, i) => `
+    <tr>
+      <td>${i + 1}</td><td>${r.agent}</td><td>${r.file}</td><td>${r.chunk}</td>
+      <td>${fmtTime(r.start)}</td><td>${fmtTime(r.end)}</td>
+      <td>${r.duration_s.toFixed(2)}s</td>
+      <td>${statusBadge(r.status === "Success" ? "success" : "failed")}</td>
+    </tr>`).join("");
+
+  let analyzerRows = (d.static_analysis || []).map(a => `
+    <tr><td>${a.tool}</td><td>${a.language}</td><td>${a.files}</td>
+        <td>${a.findings}</td><td>${(a.duration_ms / 1000).toFixed(2)}s</td></tr>`).join("");
+
+  body.innerHTML = `
+    <p class="muted">${d.repository} · ${d.branch} · ${d.model} · ${d.execution_mode}</p>
+    <table>
+      <thead><tr><th>#</th><th>Agent</th><th>File</th><th>Chunk</th><th>Start</th><th>End</th><th>Duration</th><th>Status</th></tr></thead>
+      <tbody>${llmRows || '<tr><td colspan="8" class="muted">No LLM requests recorded</td></tr>'}</tbody>
+    </table>
+    ${analyzerRows ? `
+    <h2 style="margin-top:14px">Static Analyzers</h2>
+    <table>
+      <thead><tr><th>Analyzer</th><th>Language</th><th>Files</th><th>Issues</th><th>Time</th></tr></thead>
+      <tbody>${analyzerRows}</tbody>
+    </table>` : ""}
+  `;
+}
+
+async function openLiveDetail(projectId, mrIid) {
+  const panel = document.getElementById("detail");
+  const body = document.getElementById("detail-body");
+  document.getElementById("detail-title").textContent = `${projectId} !${mrIid} — in progress`;
+  panel.style.display = "block";
+  body.innerHTML = "Loading…";
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+  const res = await fetch(`/review/status/${encodeURIComponent(projectId)}/${mrIid}`);
+  if (!res.ok) { body.innerHTML = "This review is no longer active."; return; }
+  const d = await res.json();
+
+  const agentRow = (name, label) => `<tr><td>${name}</td><td>${label}</td></tr>`;
+  const agentRows = [
+    ...d.agents_done.map(a => agentRow(a, '<span class="badge success">done</span>')),
+    ...d.agents_running.map(a => agentRow(a, '<span class="badge running">running</span>')),
+    ...d.agents_pending.map(a => agentRow(a, '<span class="muted">pending</span>')),
+  ].join("");
+
+  body.innerHTML = `
+    <p class="muted">${d.mr_title || ""} · started ${fmtTime(d.started_at)}</p>
+    <table>
+      <thead><tr><th>Agent</th><th>Status</th></tr></thead>
+      <tbody>${agentRows || '<tr><td colspan="2" class="muted">No agents registered</td></tr>'}</tbody>
+    </table>
+    <p class="muted" style="margin-top:10px">${d.agents_done.length}/${d.agents_total} agents complete</p>
+  `;
+}
+
+function closeDetail() {
+  document.getElementById("detail").style.display = "none";
+}
+
+document.getElementById("filter").addEventListener("input", render);
+document.getElementById("status-filter").addEventListener("change", render);
+document.querySelectorAll("th[data-key]").forEach(th => {
+  th.addEventListener("click", () => {
+    const key = th.dataset.key;
+    if (sortKey === key) sortDir *= -1; else { sortKey = key; sortDir = -1; }
+    render();
+  });
+});
+
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>

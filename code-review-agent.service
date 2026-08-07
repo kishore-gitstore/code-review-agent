@@ -1,0 +1,34 @@
+[Unit]
+Description=Code Review Agent (GitLab MR review bot)
+After=network-online.target
+Wants=network-online.target
+# Unlimited retries — with RestartSec=60 below, 5 failures wouldn't even fit
+# in systemd's default 10s StartLimitIntervalSec burst window anyway, but
+# setting this to 0 makes "always keep retrying" an explicit guarantee
+# rather than something that happens to work out with the default.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# The blanks below are filled in by install-service.sh from this machine —
+# this file is a template, not something to edit and copy by hand yourself.
+# Run that script instead: sudo ./install-service.sh
+User=__SERVICE_USER__
+Group=__SERVICE_USER__
+WorkingDirectory=__WORKDIR__
+EnvironmentFile=__WORKDIR__/.env
+# Runs the venv's interpreter directly — no shell activation needed. Assumes
+# the venv already exists; run ./run.sh once by hand first to create it and
+# confirm the app starts before installing this unit.
+ExecStart=__WORKDIR__/venv/bin/python main.py
+# Restart=always (not on-failure) so it comes back even after a clean exit —
+# e.g. uvicorn exiting because the configured port was briefly unavailable.
+# systemctl stop still stops it for good: that's systemd's own contract for
+# an explicit stop request and Restart= can't override it (nor should it).
+Restart=always
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

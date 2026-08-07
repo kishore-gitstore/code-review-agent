@@ -1,6 +1,6 @@
 """
 Code Review Agent — Main Entry Point
-GitHub Copilot (Claude Sonnet) + GitLab MR reviews
+Multi-agent GitLab MR reviews, powered by whichever LLM_PROVIDER is configured in .env
 """
 
 import sys
@@ -15,12 +15,16 @@ app = create_app()
 if __name__ == "__main__":
     cfg_host = os.getenv("APP_HOST", "0.0.0.0")
     cfg_port = int(os.getenv("APP_PORT", "8000"))
+    # Auto-reload is a dev convenience (run.sh enables it) — off by default so
+    # running this under systemd/a process supervisor doesn't re-exec on every
+    # file touch in production.
+    cfg_reload = os.getenv("UVICORN_RELOAD", "false").lower() == "true"
     try:
         uvicorn.run(
             "main:app",
             host=cfg_host,
             port=cfg_port,
-            reload=True,
+            reload=cfg_reload,
             log_level="info",
         )
     except KeyboardInterrupt:

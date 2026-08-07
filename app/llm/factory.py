@@ -65,3 +65,22 @@ def reset_client() -> None:
     """Force a new client to be created on next call (useful for testing)."""
     global _client
     _client = None
+
+
+_MODEL_FIELD_BY_PROVIDER = {
+    "copilot": "copilot_model",
+    "claude":  "claude_model",
+    "openai":  "openai_model",
+    "ollama":  "ollama_model",
+}
+
+
+def get_active_model_label() -> str:
+    """Human-readable 'provider (model)' string for whichever LLM_PROVIDER is
+    actually configured — used anywhere the UI displays which model produced
+    a review, instead of a hardcoded provider name."""
+    cfg = get_settings()
+    provider = cfg.llm_provider.lower().strip()
+    field = _MODEL_FIELD_BY_PROVIDER.get(provider)
+    model = getattr(cfg, field, None) if field else None
+    return f"{provider} ({model})" if model else provider

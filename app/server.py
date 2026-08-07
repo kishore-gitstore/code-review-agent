@@ -8,22 +8,36 @@ Progress is queryable at GET /review/status/{project_id}/{mr_iid}.
 """
 
 from __future__ import annotations
+import asyncio
+import shutil
 import structlog
+import tempfile
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 
 from app.settings import get_settings
+from app.execution import detect_hardware, resolve_execution_policy, set_execution_policy
 from app.llm.factory import get_llm_client
 from app.gitlab.client import get_gitlab_client
 from app.agents.coordinator import CoordinatorAgent
+from app.reporting import ExecutionReport, list_reports, read_report
 from app.utils.models import MRContext
-from app.utils.diff_parser import get_changed_files, get_path_map
+from app.utils.diff_parser import get_changed_files, get_path_map, parse_diff
 
 log = structlog.get_logger(__name__)
+
+# Gates how many MR reviews run through their full pipeline (GitLab fetch +
+# static analysis + LLM agents + posting) at once. Sized from the resolved
+# execution policy once lifespan() runs; defaults to 1 (safe/serial) so a
+# review triggered before startup completes, or in a test that never runs
+# lifespan, still behaves correctly.
+_review_semaphore = asyncio.Semaphore(1)
 
 # ── In-memory review progress tracker ────────────────────────────────────────
 
@@ -32,6 +46,8 @@ class ReviewProgress:
     project_id:     str | int
     mr_iid:         int
     mr_title:       str = ""
+    project_name:   str = ""
+    branch:         str = ""
     status:         str = "running"        # running | done | error
     started_at:     str = ""
     finished_at:    Optional[str] = None
@@ -53,6 +69,8 @@ class ReviewProgress:
             "project_id":     self.project_id,
             "mr_iid":         self.mr_iid,
             "mr_title":       self.mr_title,
+            "project_name":   self.project_name,
+            "branch":         self.branch,
             "status":         self.status,
             "started_at":     self.started_at,
             "finished_at":    self.finished_at,
@@ -149,13 +167,31 @@ def _trim() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _review_semaphore
     cfg = get_settings()
-    log.info("startup", model=cfg.copilot_model, gitlab=cfg.gitlab_url)
+    log.info("startup", provider=cfg.llm_provider, gitlab=cfg.gitlab_url)
+
+    # Hardware detection + execution-mode resolution must happen before the
+    # LLM client singleton is constructed (get_llm_client(), just below) —
+    # OllamaClient sizes its own concurrency semaphore from the resolved
+    # policy at construction time.
+    hardware = await detect_hardware(
+        ollama_base_url=cfg.ollama_base_url if cfg.llm_provider == "ollama" else None,
+        ollama_model=cfg.ollama_model if cfg.llm_provider == "ollama" else None,
+    )
+    policy = resolve_execution_policy(cfg, hardware)
+    set_execution_policy(policy)
+    _review_semaphore = asyncio.Semaphore(policy.max_parallel_reviews)
+    log.info("execution.policy_active", mode=policy.mode,
+             max_parallel_reviews=policy.max_parallel_reviews,
+             max_parallel_analyzers=policy.max_parallel_analyzers,
+             max_parallel_llm_requests=policy.max_parallel_llm_requests)
+
     health = await get_llm_client().health_check()
     if health["status"] != "ok":
-        log.warning("copilot.unavailable", detail=health)
+        log.warning("llm.unavailable", detail=health)
     else:
-        log.info("copilot.ready", model=health["model"])
+        log.info("llm.ready", provider=health.get("provider"), model=health["model"])
     yield
     log.info("shutdown")
 
@@ -171,9 +207,9 @@ def create_app() -> FastAPI:
     # ── Health ────────────────────────────────────────────────────────────
     @app.get("/health")
     async def health():
-        copilot = await get_llm_client().health_check()
-        return {"status": copilot["status"], "provider": copilot.get("provider"),
-                "model": copilot.get("model")}
+        llm = await get_llm_client().health_check()
+        return {"status": llm["status"], "provider": llm.get("provider"),
+                "model": llm.get("model")}
 
     # ── Progress endpoints ────────────────────────────────────────────────
     @app.get("/review/active")
@@ -188,6 +224,48 @@ def create_app() -> FastAPI:
         if key not in _reviews:
             raise HTTPException(status_code=404, detail="No review found for this MR")
         return _reviews[key].as_dict()
+
+    @app.post("/review/{project_id}/{mr_iid}/clear-stale-note")
+    async def clear_stale_note(project_id: str, mr_iid: int):
+        """
+        Force-delete a dangling "review in progress" note right now, without
+        waiting for the next push to this MR to auto-clean it (see
+        delete_stale_progress_notes() in _run_review). Refuses while this
+        process itself still thinks a review is running for this MR — that's
+        very likely just a slow review, not a stuck one; check
+        /review/status or the service logs first.
+        """
+        key = _rkey(project_id, mr_iid)
+        if (p := _reviews.get(key)) and p.status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail="A review is currently marked running for this MR — check /review/status "
+                       "or the logs before force-clearing; this looks like it's still in progress, not stuck.",
+            )
+        deleted = await get_gitlab_client().delete_stale_progress_notes(project_id, mr_iid)
+        return {"deleted": deleted}
+
+    # ── Dashboard ─────────────────────────────────────────────────────────
+    @app.get("/dashboard")
+    async def dashboard():
+        """Serves the static dashboard page; it fetches /api/reports itself."""
+        return FileResponse(Path(__file__).parent / "static" / "dashboard.html")
+
+    @app.get("/api/reports")
+    async def api_list_reports(limit: int = 200):
+        """Execution-summary list backing the dashboard table — one entry per
+        completed review (local CLI or GitLab-triggered), newest first."""
+        return list_reports(limit=limit)
+
+    @app.get("/api/reports/{filename}")
+    async def api_get_report(filename: str):
+        """Full stats (including the per-LLM-request table) for one report."""
+        try:
+            return read_report(filename)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid report filename")
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="report not found")
 
     # ── GitLab Webhook ────────────────────────────────────────────────────
     @app.post("/webhook/gitlab", status_code=202)
@@ -298,30 +376,167 @@ async def _run_review(project_id: str | int, mr_iid: int, mr_title: str = "") ->
     if not _register(project_id, mr_iid, mr_title, agent_names):
         return  # duplicate — already running
 
-    gitlab     = get_gitlab_client()
-    mr_details = await gitlab.get_mr_details(project_id, mr_iid)
-    diff       = await gitlab.get_mr_diff(project_id, mr_iid)
-    mr_title   = mr_title or mr_details.get("title", "")
+    # Everything from here on is the expensive part (GitLab fetch, cloning,
+    # static analysis, LLM agents, posting) — gated by max_parallel_reviews.
+    # Registration above stays outside the gate so the duplicate-suppression
+    # race-safety guarantee (see docstring) holds regardless of queue depth.
+    queued_at = time.monotonic()
+    async with _review_semaphore:
+        queue_wait_ms = int((time.monotonic() - queued_at) * 1000)
+        if queue_wait_ms > 0:
+            log.info("review.dequeued", mr=mr_iid, project=project_id, queue_wait_ms=queue_wait_ms)
 
-    if p := _reviews.get(_rkey(project_id, mr_iid)):
-        p.mr_title = mr_title
+        # Covers the whole gated review — GitLab fetch/clone included, not
+        # just the coordinator's LLM/static-analysis stage — so the report's
+        # Total Duration matches what a human waited for end to end.
+        review_started_at = datetime.now()
 
-    ctx = MRContext(
-        project_id=project_id,
-        mr_iid=mr_iid,
-        title=mr_title,
-        description=mr_details.get("description", "") or "",
-        author=mr_details.get("author", {}).get("username", "unknown"),
-        source_branch=mr_details.get("source_branch", ""),
-        target_branch=mr_details.get("target_branch", ""),
-        diff=diff,
-        changed_files=get_changed_files(diff),
-    )
+        cfg    = get_settings()
+        gitlab = get_gitlab_client()
 
-    result = await coordinator.run(
-        ctx,
-        on_agent_start=lambda agent: _on_agent_start(project_id, mr_iid, agent),
-        on_agent_done=lambda agent, n: _on_agent_done(project_id, mr_iid, agent, n),
-    )
-    await gitlab.post_review(result, mr_details, get_path_map(diff))
-    _finish(project_id, mr_iid, result.total_issues, result.critical_count, result.high_count)
+        # Clean up any "in progress" note a previous run left dangling — e.g.
+        # the process crashed/restarted mid-review, so its own try/finally
+        # cleanup below never got to run. Safe: the duplicate-check in
+        # _register() above already guarantees no OTHER run is currently
+        # active for this MR right now, so any marker note found here can
+        # only be a stale leftover, never a currently-live one.
+        try:
+            cleaned = await gitlab.delete_stale_progress_notes(project_id, mr_iid)
+            if cleaned:
+                log.warning("review.stale_progress_note.cleaned", mr=mr_iid, count=cleaned)
+        except Exception as exc:
+            log.warning("review.stale_progress_note.cleanup_failed", mr=mr_iid, error=str(exc))
+
+        # Transient "review in progress" note — gives immediate feedback on the
+        # MR while the (potentially slow, LLM-bound) review runs. Deleted once
+        # real results are ready to post; see the finally block below for the
+        # failure path, where it's also cleaned up rather than left dangling.
+        progress_note_id: Optional[int] = None
+        if cfg.post_progress_comment:
+            try:
+                progress_note_id = await gitlab.post_progress_note(project_id, mr_iid)
+            except Exception as exc:
+                log.warning("review.progress_note.failed", mr=mr_iid, error=str(exc))
+
+        mr_details = await gitlab.get_mr_details(project_id, mr_iid)
+        diff       = await gitlab.get_mr_diff(project_id, mr_iid)
+        mr_title   = mr_title or mr_details.get("title", "")
+
+        if p := _reviews.get(_rkey(project_id, mr_iid)):
+            p.mr_title = mr_title
+
+        source_branch = mr_details.get("source_branch", "")
+        head_sha      = (mr_details.get("diff_refs") or {}).get("head_sha", "")
+        changed_files = get_changed_files(diff)
+        file_diffs    = parse_diff(diff)
+
+        if p := _reviews.get(_rkey(project_id, mr_iid)):
+            p.branch = source_branch
+
+        try:
+            project      = await gitlab.get_project(project_id)
+            project_name = project.get("path_with_namespace") or project.get("name") or str(project_id)
+        except Exception as exc:
+            log.warning("review.project_lookup_failed", project=project_id, error=str(exc))
+            project_name = str(project_id)
+
+        if p := _reviews.get(_rkey(project_id, mr_iid)):
+            p.project_name = project_name
+
+        report = ExecutionReport(
+            repository=project_name, branch=source_branch,
+            project_id=project_id, project_name=project_name, mr_iid=mr_iid, mr_title=mr_title,
+        )
+        report.files_changed = len(changed_files)
+        report.lines_added   = sum(fd.added_lines for fd in file_diffs)
+        report.lines_removed = sum(fd.removed_lines for fd in file_diffs)
+
+        repo_root: Optional[str] = None
+        repo_root_note: Optional[str] = None
+        clone_dir: Optional[str] = None
+
+        if not cfg.enable_static_analysis:
+            pass  # coordinator won't run the static stage at all — no note needed
+        elif not cfg.clone_for_static_analysis:
+            repo_root_note = "static analysis skipped — CLONE_FOR_STATIC_ANALYSIS is disabled"
+        elif not source_branch:
+            repo_root_note = "static analysis skipped — MR has no source branch"
+        else:
+            clone_dir = tempfile.mkdtemp(prefix=f"cra-mr{mr_iid}-")
+            cloned, reason = await gitlab.clone_mr_source(project_id, source_branch, clone_dir)
+            if cloned:
+                repo_root = clone_dir
+            elif head_sha and changed_files:
+                # Full clone failed (no git, network issue, auth problem, ...) — fall
+                # back to fetching just the changed files via the GitLab API. Lighter
+                # and doesn't need `git`, but tools needing whole-project context
+                # (Roslyn, Clippy) will report themselves unavailable in this mode.
+                fetched, fetch_reason = await gitlab.fetch_changed_files(
+                    project_id, changed_files, head_sha, clone_dir
+                )
+                if fetched:
+                    repo_root = clone_dir
+                else:
+                    shutil.rmtree(clone_dir, ignore_errors=True)
+                    clone_dir = None
+                    repo_root_note = f"static analysis skipped — clone failed ({reason}); file fetch also failed ({fetch_reason})"
+            else:
+                shutil.rmtree(clone_dir, ignore_errors=True)
+                clone_dir = None
+                repo_root_note = f"static analysis skipped — {reason}"
+
+        try:
+            ctx = MRContext(
+                project_id=project_id,
+                mr_iid=mr_iid,
+                title=mr_title,
+                description=mr_details.get("description", "") or "",
+                author=mr_details.get("author", {}).get("username", "unknown"),
+                source_branch=source_branch,
+                target_branch=mr_details.get("target_branch", ""),
+                diff=diff,
+                changed_files=changed_files,
+                repo_root=repo_root,
+                repo_root_note=repo_root_note,
+            )
+
+            report.started_at = review_started_at
+            result = await coordinator.run(
+                ctx,
+                on_agent_start=lambda agent: _on_agent_start(project_id, mr_iid, agent),
+                on_agent_done=lambda agent, n: _on_agent_done(project_id, mr_iid, agent, n),
+                on_llm_request=report.on_llm_request,
+                on_analyzer_done=report.on_analyzer_done,
+                on_phase=report.on_phase,
+            )
+            report.result = result
+            report.status = "success"
+
+            if progress_note_id is not None:
+                try:
+                    await gitlab.delete_mr_note(project_id, mr_iid, progress_note_id)
+                except Exception as exc:
+                    log.warning("review.progress_note.delete_failed", mr=mr_iid, error=str(exc))
+                progress_note_id = None
+
+            await gitlab.post_review(result, mr_details, get_path_map(diff))
+            _finish(project_id, mr_iid, result.total_issues, result.critical_count, result.high_count)
+        except Exception as exc:
+            report.status = "failed"
+            report.error = str(exc)
+            raise
+        finally:
+            report.finished_at = datetime.now()
+            report.print_console()
+            report.log_summary()
+            report.save_json()
+
+            # Also cleaned up on the failure path (coordinator/post_review raised)
+            # so a botched review doesn't leave the placeholder note dangling.
+            if progress_note_id is not None:
+                try:
+                    await gitlab.delete_mr_note(project_id, mr_iid, progress_note_id)
+                except Exception as exc:
+                    log.warning("review.progress_note.delete_failed", mr=mr_iid, error=str(exc))
+            if clone_dir:
+                shutil.rmtree(clone_dir, ignore_errors=True)

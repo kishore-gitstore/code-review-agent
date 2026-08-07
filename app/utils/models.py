@@ -32,6 +32,7 @@ class ReviewResult(BaseModel):
     project_id:      str | int
     summary:         str
     comments:        list[ReviewComment] = Field(default_factory=list)
+    static_analysis_notes: list[str] = Field(default_factory=list)  # why a language was skipped, if any
     total_issues:    int = 0
     critical_count:  int = 0
     high_count:      int = 0
@@ -57,3 +58,5 @@ class MRContext(BaseModel):
     target_branch: str
     diff:          str          # raw unified diff text
     changed_files: list[str]    # list of file paths changed
+    repo_root:     Optional[str] = None  # local checkout root, enables static analysis
+    repo_root_note: Optional[str] = None  # why repo_root is None, if it is (surfaced to the user)

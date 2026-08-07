@@ -50,8 +50,9 @@ Do NOT report style issues covered by a linter (whitespace, line length, import 
 Respond ONLY with a JSON array as instructed.
 """.strip()
 
-    async def review(self, ctx, diff: str) -> list[ReviewComment]:
+    async def review(self, ctx, diff: str, static_findings=None, file_path=None, on_error=None) -> list[ReviewComment]:
         comments = []
+        fp = file_path or "unknown"
 
         # --- Rule-based quick checks ---
         if "/ 0" in diff:
@@ -60,7 +61,7 @@ Respond ONLY with a JSON array as instructed.
                 title="Division by zero risk",
                 description="Division by zero will cause runtime errors.",
                 severity=Severity.critical,
-                file_path="unknown",
+                file_path=fp,
                 line=None
             ))
 
@@ -70,10 +71,10 @@ Respond ONLY with a JSON array as instructed.
                 title="Potential null dereference",
                 description="Calling methods on a null reference will crash the program.",
                 severity=Severity.high,
-                file_path="unknown",
+                file_path=fp,
                 line=None
             ))
 
         # --- LLM analysis ---
-        llm_comments = await super().review(ctx, diff)
+        llm_comments = await super().review(ctx, diff, static_findings, fp, on_error=on_error)
         return comments + llm_comments
