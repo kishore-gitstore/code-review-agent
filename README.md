@@ -190,7 +190,7 @@ git clone https://github.com/your-org/code-review-agent.git
 cd code-review-agent
 
 cp .env.example .env
-# Edit .env — set GITLAB_TOKEN and GITLAB_WEBHOOK_SECRET
+# Edit .env — set GITLAB_INSTANCES (see "Multiple GitLab Servers" below)
 ```
 
 ### 3. Install Python dependencies
@@ -211,10 +211,44 @@ python main.py
 ### 5. Configure GitLab Webhook
 
 1. Go to your GitLab project → **Settings → Webhooks**
-2. Set URL: `https://your-server.com/webhook/gitlab`
-3. Set Secret Token: (same as `GITLAB_WEBHOOK_SECRET` in `.env`)
+2. Set URL: `https://your-server.com/webhook/gitlab/<instance>` — `<instance>` is
+   the key you gave this server in `GITLAB_INSTANCES` (e.g. `gitlab_com`)
+3. Set Secret Token: that instance's `webhook_secret` from `.env`
 4. Enable trigger: ✅ **Merge request events**
 5. Click **Add webhook**
+
+---
+
+## Multiple GitLab Servers
+
+The agent can review MRs across more than one GitLab server (e.g. `gitlab.com`
+plus a self-hosted instance) — each one needs its own token, since tokens
+aren't portable between servers. Configure them as a single JSON object in
+`.env`, keyed by a short name you choose for each server:
+
+```bash
+GITLAB_INSTANCES={"gitlab_com":{"url":"https://gitlab.com","token":"glpat-xxxx","webhook_secret":"secret1"},"internal":{"url":"https://gitlab.mycompany.internal","token":"glpat-yyyy","webhook_secret":"secret2"}}
+```
+
+Then, in each GitLab server's **Settings → Webhooks**, point the webhook URL
+at that server's own key: `https://your-server.com/webhook/gitlab/gitlab_com`
+for the first, `https://your-server.com/webhook/gitlab/internal` for the
+second. The agent looks up which URL/token/secret to use from the key in the
+path — GitLab itself has no notion of your instance names, so this is how it
+tells them apart.
+
+For the manual trigger endpoint, pass the instance explicitly:
+
+```bash
+curl -X POST http://localhost:8000/review \
+  -H "Content-Type: application/json" \
+  -d '{"instance": "internal", "project_id": "myorg/myrepo", "mr_iid": 42}'
+```
+
+(`instance` can be omitted only when exactly one server is configured.)
+
+Progress and report endpoints are namespaced by instance too:
+`GET /review/status/{instance}/{project_id}/{mr_iid}`.
 
 ---
 
@@ -302,8 +336,12 @@ python scripts/review_local.py --json
 ```bash
 curl -X POST http://localhost:8000/review \
   -H "Content-Type: application/json" \
-  -d '{"project_id": "myorg/myrepo", "mr_iid": 42}'
+  -d '{"instance": "gitlab_com", "project_id": "myorg/myrepo", "mr_iid": 42}'
 ```
+
+`instance` matches a key in `GITLAB_INSTANCES` — see
+[Multiple GitLab Servers](#multiple-gitlab-servers). It can be omitted only
+when exactly one instance is configured.
 
 ---
 
@@ -318,9 +356,7 @@ curl -X POST http://localhost:8000/review \
 | `MAX_PARALLEL_REVIEWS`    | `1`                         | Concurrent MR reviews end-to-end (gpu/cloud mode only — forced to 1 in cpu mode) |
 | `MAX_PARALLEL_ANALYZERS`  | `1`                         | Concurrent static-analysis language groups (gpu/cloud mode only — forced to 1 in cpu mode) |
 | `MAX_PARALLEL_LLM_REQUESTS` | `1`                       | Concurrent LLM requests, across agents and MRs (gpu/cloud mode only — forced to 1 in cpu mode) |
-| `GITLAB_URL`              | `https://gitlab.com`        | Your GitLab instance URL                 |
-| `GITLAB_TOKEN`            | —                           | Personal/Project access token (**required**) |
-| `GITLAB_WEBHOOK_SECRET`   | —                           | Webhook secret for signature verification|
+| `GITLAB_INSTANCES`        | `{}`                        | JSON object of `{"name": {"url", "token", "webhook_secret"}}` — one entry per GitLab server (**required**, at least one). See [Multiple GitLab Servers](#multiple-gitlab-servers) |
 | `MAX_DIFF_LINES`          | `2000`                      | Truncate diffs larger than this          |
 | `MIN_SEVERITY_TO_COMMENT` | `low`                       | Only post issues at or above this level  |
 | `POST_INLINE_COMMENTS`    | `true`                      | Post per-line diff comments              |

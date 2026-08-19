@@ -17,6 +17,13 @@ from app.utils.models import ReviewComment, ReviewResult, Severity
 
 log = structlog.get_logger(__name__)
 
+
+class UnknownGitLabInstance(Exception):
+    """Raised when an instance key isn't in GITLAB_INSTANCES (settings.py)."""
+    def __init__(self, instance: str):
+        super().__init__(f"unknown GitLab instance {instance!r} — check GITLAB_INSTANCES in .env")
+        self.instance = instance
+
 # Marker prefix for the transient "review in progress" note (see
 # post_progress_note/delete_stale_progress_notes) — a shared constant so the
 # text posted and the text matched during cleanup can't drift apart.
@@ -32,13 +39,19 @@ _EMOJI = {
 
 class GitLabClient:
 
-    def __init__(self):
+    def __init__(self, instance: str):
         cfg = get_settings()
-        self.base_url = cfg.gitlab_url.rstrip("/") + "/api/v4"
+        inst = cfg.gitlab_instances.get(instance)
+        if inst is None:
+            raise UnknownGitLabInstance(instance)
+        self.instance = instance
+        self.base_url = inst.url.rstrip("/") + "/api/v4"
         self.headers  = {
-            "PRIVATE-TOKEN": cfg.gitlab_token,
+            "PRIVATE-TOKEN": inst.token,
             "Content-Type":  "application/json",
         }
+        self._token = inst.token
+        self._webhook_secret = inst.webhook_secret
 
     # ── Fetch ─────────────────────────────────────────────────────────────
 
@@ -80,7 +93,6 @@ class GitLabClient:
         `reason` is specific enough to surface directly to the user (e.g. in
         the MR summary comment) so a broken clone isn't just silently invisible.
         """
-        cfg = get_settings()
         try:
             project = await self.get_project(project_id)
         except Exception as exc:
@@ -94,7 +106,7 @@ class GitLabClient:
             log.warning("gitlab.clone.no_url", project=project_id)
             return False, reason
 
-        authed_url = _with_token(clone_url, cfg.gitlab_token)
+        authed_url = _with_token(clone_url, self._token)
         cmd = [
             "git", "clone", "--depth", "1", "--branch", source_branch,
             "--single-branch", authed_url, dest_dir,
@@ -321,12 +333,10 @@ class GitLabClient:
 
     # ── Webhook verification ──────────────────────────────────────────────
 
-    @staticmethod
-    def verify_webhook(token_header: str) -> bool:
-        secret = get_settings().gitlab_webhook_secret
-        if not secret:
+    def verify_webhook(self, token_header: str) -> bool:
+        if not self._webhook_secret:
             return True
-        return hmac.compare_digest(secret, token_header)
+        return hmac.compare_digest(self._webhook_secret, token_header)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -398,12 +408,14 @@ def _build_summary(result: ReviewResult, failed_inline: list[ReviewComment]) -> 
     return header + "".join(sections) + footer
 
 
-# Singleton
-_client: GitLabClient | None = None
+# One client per configured GitLab instance, built lazily and cached.
+_clients: dict[str, GitLabClient] = {}
 
 
-def get_gitlab_client() -> GitLabClient:
-    global _client
-    if _client is None:
-        _client = GitLabClient()
-    return _client
+def get_gitlab_client(instance: str) -> GitLabClient:
+    """Raises UnknownGitLabInstance if `instance` isn't in GITLAB_INSTANCES."""
+    client = _clients.get(instance)
+    if client is None:
+        client = GitLabClient(instance)
+        _clients[instance] = client
+    return client

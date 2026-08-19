@@ -80,6 +80,7 @@ class ExecutionReport:
         self,
         repository: str,
         branch: str,
+        instance: str = "",
         project_id: str | int | None = None,
         project_name: str = "",
         mr_iid: int | None = None,
@@ -87,6 +88,7 @@ class ExecutionReport:
     ):
         self.repository = repository
         self.branch = branch
+        self.instance = instance
         self.project_id = project_id
         self.project_name = project_name
         self.mr_iid = mr_iid
@@ -145,6 +147,7 @@ class ExecutionReport:
         return {
             "repository": self.repository,
             "branch": self.branch,
+            "instance": self.instance,
             "project_id": self.project_id,
             "project_name": self.project_name,
             "mr_iid": self.mr_iid,
@@ -191,6 +194,8 @@ class ExecutionReport:
         print(rule + "\n")
 
         analyzer_names = sorted({a["tool"] for a in self.analyzers})
+        if self.instance:
+            print(f"GitLab Instance      : {self.instance}")
         if self.project_id is not None:
             print(f"Project ID           : {self.project_id}")
         if self.project_name:
@@ -310,7 +315,8 @@ class ExecutionReport:
         stamp = self.started_at.strftime("%Y%m%d_%H%M%S") if self.started_at else "unknown"
         if self.project_id is not None and self.mr_iid is not None:
             safe_project = str(self.project_id).replace("/", "_")
-            name = f"review_{safe_project}_{self.mr_iid}_{stamp}.json"
+            safe_instance = f"{self.instance}_" if self.instance else ""
+            name = f"review_{safe_instance}{safe_project}_{self.mr_iid}_{stamp}.json"
         else:
             name = f"review_local_{stamp}.json"
         path = REPORTS_DIR / name

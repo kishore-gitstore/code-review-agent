@@ -23,7 +23,7 @@ fi
 pip install -q --disable-pip-version-check -r requirements.txt
 
 if [ ! -f ".env" ]; then
-    echo ".env not found — copy .env.example to .env and set GITLAB_TOKEN / GITLAB_WEBHOOK_SECRET first." >&2
+    echo ".env not found — copy .env.example to .env and set GITLAB_INSTANCES first." >&2
     exit 1
 fi
 

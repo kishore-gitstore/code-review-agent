@@ -2,8 +2,15 @@
 app/settings.py — Central settings. Change LLM_PROVIDER in .env to switch models.
 """
 
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Literal
+
+
+class GitLabInstance(BaseModel):
+    url: str
+    token: str
+    webhook_secret: str = ""
 
 
 class Settings(BaseSettings):
@@ -34,10 +41,12 @@ class Settings(BaseSettings):
     ollama_model: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
     ollama_timeout: int = 300  # local coder models can easily take minutes per request
 
-    # GitLab
-    gitlab_url: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-    gitlab_token: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-    gitlab_webhook_secret: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    # GitLab — one or more instances, keyed by a short name of your choosing.
+    # That name appears in the webhook URL (/webhook/gitlab/{name}) and in the
+    # manual-trigger request body, so the agent knows which server+token to use.
+    # Configure as a single JSON object via the GITLAB_INSTANCES env var, e.g.:
+    #   GITLAB_INSTANCES={"gitlab_com":{"url":"https://gitlab.com","token":"...","webhook_secret":"..."},"internal":{"url":"https://gitlab.internal","token":"...","webhook_secret":"..."}}
+    gitlab_instances: dict[str, GitLabInstance] = Field(default_factory=dict)
 
     # Agent behaviour
     max_diff_lines: int = 2000

@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from app.settings import get_settings
 from app.execution import detect_hardware, resolve_execution_policy, set_execution_policy
 from app.llm.factory import get_llm_client
-from app.gitlab.client import get_gitlab_client
+from app.gitlab.client import get_gitlab_client, UnknownGitLabInstance
 from app.agents.coordinator import CoordinatorAgent
 from app.reporting import ExecutionReport, list_reports, read_report
 from app.utils.models import MRContext
@@ -43,6 +43,7 @@ _review_semaphore = asyncio.Semaphore(1)
 
 @dataclass
 class ReviewProgress:
+    instance:       str
     project_id:     str | int
     mr_iid:         int
     mr_title:       str = ""
@@ -66,6 +67,7 @@ class ReviewProgress:
 
     def as_dict(self) -> dict:
         return {
+            "instance":       self.instance,
             "project_id":     self.project_id,
             "mr_iid":         self.mr_iid,
             "mr_title":       self.mr_title,
@@ -90,22 +92,23 @@ _reviews: dict[str, ReviewProgress] = {}
 _MAX_COMPLETED = 50
 
 
-def _rkey(project_id: str | int, mr_iid: int) -> str:
-    return f"{project_id}/{mr_iid}"
+def _rkey(instance: str, project_id: str | int, mr_iid: int) -> str:
+    return f"{instance}/{project_id}/{mr_iid}"
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _register(project_id: str | int, mr_iid: int, mr_title: str, agent_names: list[str]) -> bool:
+def _register(instance: str, project_id: str | int, mr_iid: int, mr_title: str, agent_names: list[str]) -> bool:
     """Register a new review. Returns False if one is already running for this MR."""
-    key = _rkey(project_id, mr_iid)
+    key = _rkey(instance, project_id, mr_iid)
     existing = _reviews.get(key)
     if existing and existing.status == "running":
-        log.warning("review.duplicate_skipped", mr=mr_iid, project=project_id)
+        log.warning("review.duplicate_skipped", instance=instance, mr=mr_iid, project=project_id)
         return False
     _reviews[key] = ReviewProgress(
+        instance=instance,
         project_id=project_id,
         mr_iid=mr_iid,
         mr_title=mr_title,
@@ -113,43 +116,43 @@ def _register(project_id: str | int, mr_iid: int, mr_title: str, agent_names: li
         started_at=_now(),
         agents_all=list(agent_names),
     )
-    log.info("review.registered", mr=mr_iid, project=project_id, agents=agent_names)
+    log.info("review.registered", instance=instance, mr=mr_iid, project=project_id, agents=agent_names)
     return True
 
 
-def _on_agent_start(project_id: str | int, mr_iid: int, agent: str) -> None:
-    if p := _reviews.get(_rkey(project_id, mr_iid)):
+def _on_agent_start(instance: str, project_id: str | int, mr_iid: int, agent: str) -> None:
+    if p := _reviews.get(_rkey(instance, project_id, mr_iid)):
         if agent not in p.agents_running:
             p.agents_running.append(agent)
-        log.info("review.agent.started", mr=mr_iid, agent=agent,
+        log.info("review.agent.started", instance=instance, mr=mr_iid, agent=agent,
                  progress=f"{len(p.agents_done)}/{len(p.agents_all)}")
 
 
-def _on_agent_done(project_id: str | int, mr_iid: int, agent: str, findings: int) -> None:
-    if p := _reviews.get(_rkey(project_id, mr_iid)):
+def _on_agent_done(instance: str, project_id: str | int, mr_iid: int, agent: str, findings: int) -> None:
+    if p := _reviews.get(_rkey(instance, project_id, mr_iid)):
         if agent in p.agents_running:
             p.agents_running.remove(agent)
         if agent not in p.agents_done:
             p.agents_done.append(agent)
-        log.info("review.agent.done", mr=mr_iid, agent=agent, findings=findings,
+        log.info("review.agent.done", instance=instance, mr=mr_iid, agent=agent, findings=findings,
                  progress=f"{len(p.agents_done)}/{len(p.agents_all)}",
                  remaining=p.agents_pending)
 
 
-def _finish(project_id: str | int, mr_iid: int, total: int, critical: int, high: int) -> None:
-    if p := _reviews.get(_rkey(project_id, mr_iid)):
+def _finish(instance: str, project_id: str | int, mr_iid: int, total: int, critical: int, high: int) -> None:
+    if p := _reviews.get(_rkey(instance, project_id, mr_iid)):
         p.status = "done"
         p.finished_at = _now()
         p.total_issues = total
         p.critical_count = critical
         p.high_count = high
         p.agents_running = []
-        log.info("review.done", mr=mr_iid, total=total, critical=critical, high=high)
+        log.info("review.done", instance=instance, mr=mr_iid, total=total, critical=critical, high=high)
     _trim()
 
 
-def _fail(project_id: str | int, mr_iid: int, error: str) -> None:
-    if p := _reviews.get(_rkey(project_id, mr_iid)):
+def _fail(instance: str, project_id: str | int, mr_iid: int, error: str) -> None:
+    if p := _reviews.get(_rkey(instance, project_id, mr_iid)):
         p.status = "error"
         p.finished_at = _now()
         p.error = error
@@ -169,7 +172,7 @@ def _trim() -> None:
 async def lifespan(app: FastAPI):
     global _review_semaphore
     cfg = get_settings()
-    log.info("startup", provider=cfg.llm_provider, gitlab=cfg.gitlab_url)
+    log.info("startup", provider=cfg.llm_provider, gitlab_instances=list(cfg.gitlab_instances.keys()))
 
     # Hardware detection + execution-mode resolution must happen before the
     # LLM client singleton is constructed (get_llm_client(), just below) —
@@ -217,16 +220,16 @@ def create_app() -> FastAPI:
         """List all running and recently completed reviews."""
         return [p.as_dict() for p in _reviews.values()]
 
-    @app.get("/review/status/{project_id}/{mr_iid}")
-    async def get_review_status(project_id: str, mr_iid: int):
+    @app.get("/review/status/{instance}/{project_id}/{mr_iid}")
+    async def get_review_status(instance: str, project_id: str, mr_iid: int):
         """Get live progress for a specific MR review."""
-        key = _rkey(project_id, mr_iid)
+        key = _rkey(instance, project_id, mr_iid)
         if key not in _reviews:
             raise HTTPException(status_code=404, detail="No review found for this MR")
         return _reviews[key].as_dict()
 
-    @app.post("/review/{project_id}/{mr_iid}/clear-stale-note")
-    async def clear_stale_note(project_id: str, mr_iid: int):
+    @app.post("/review/{instance}/{project_id}/{mr_iid}/clear-stale-note")
+    async def clear_stale_note(instance: str, project_id: str, mr_iid: int):
         """
         Force-delete a dangling "review in progress" note right now, without
         waiting for the next push to this MR to auto-clean it (see
@@ -235,14 +238,18 @@ def create_app() -> FastAPI:
         very likely just a slow review, not a stuck one; check
         /review/status or the service logs first.
         """
-        key = _rkey(project_id, mr_iid)
+        key = _rkey(instance, project_id, mr_iid)
         if (p := _reviews.get(key)) and p.status == "running":
             raise HTTPException(
                 status_code=409,
                 detail="A review is currently marked running for this MR — check /review/status "
                        "or the logs before force-clearing; this looks like it's still in progress, not stuck.",
             )
-        deleted = await get_gitlab_client().delete_stale_progress_notes(project_id, mr_iid)
+        try:
+            gitlab = get_gitlab_client(instance)
+        except UnknownGitLabInstance as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        deleted = await gitlab.delete_stale_progress_notes(project_id, mr_iid)
         return {"deleted": deleted}
 
     # ── Dashboard ─────────────────────────────────────────────────────────
@@ -268,8 +275,9 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="report not found")
 
     # ── GitLab Webhook ────────────────────────────────────────────────────
-    @app.post("/webhook/gitlab", status_code=202)
+    @app.post("/webhook/gitlab/{instance}", status_code=202)
     async def gitlab_webhook(
+        instance: str,
         request: Request,
         background_tasks: BackgroundTasks,
         x_gitlab_token: str | None = Header(default=None),
@@ -277,7 +285,12 @@ def create_app() -> FastAPI:
     ):
         await request.body()  # consume body before json()
 
-        if not get_gitlab_client().verify_webhook(x_gitlab_token or ""):
+        try:
+            gitlab = get_gitlab_client(instance)
+        except UnknownGitLabInstance as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+        if not gitlab.verify_webhook(x_gitlab_token or ""):
             raise HTTPException(status_code=401, detail="Invalid webhook token")
 
         if x_gitlab_event != "Merge Request Hook":
@@ -298,23 +311,23 @@ def create_app() -> FastAPI:
         if not project_id or not mr_iid:
             raise HTTPException(status_code=400, detail="Missing project_id or mr_iid")
 
-        log.info("webhook.mr_event", project=project_id, mr=mr_iid, action=action)
+        log.info("webhook.mr_event", instance=instance, project=project_id, mr=mr_iid, action=action)
 
         # Suppress duplicate if already running
-        existing = _reviews.get(_rkey(project_id, mr_iid))
+        existing = _reviews.get(_rkey(instance, project_id, mr_iid))
         if existing and existing.status == "running":
-            log.warning("webhook.duplicate_ignored", mr=mr_iid, project=project_id)
+            log.warning("webhook.duplicate_ignored", instance=instance, mr=mr_iid, project=project_id)
             return JSONResponse({
                 "status": "already_in_progress",
                 "mr_iid": mr_iid,
                 "progress": existing.as_dict(),
             })
 
-        background_tasks.add_task(_run_review_bg, project_id, mr_iid, mr_title)
+        background_tasks.add_task(_run_review_bg, instance, project_id, mr_iid, mr_title)
         return JSONResponse({
             "status": "accepted",
             "mr_iid": mr_iid,
-            "status_url": f"/review/status/{project_id}/{mr_iid}",
+            "status_url": f"/review/status/{instance}/{project_id}/{mr_iid}",
         }, status_code=202)
 
     # ── Manual trigger ────────────────────────────────────────────────────
@@ -322,16 +335,30 @@ def create_app() -> FastAPI:
     async def manual_review(body: dict, background_tasks: BackgroundTasks):
         """
         Manually trigger a review.
-        POST /review  { "project_id": "group/repo", "mr_iid": 42 }
-        Returns 202 immediately; poll GET /review/status/{project_id}/{mr_iid} for progress.
+        POST /review  { "instance": "gitlab_com", "project_id": "group/repo", "mr_iid": 42 }
+        "instance" can be omitted only if exactly one is configured in GITLAB_INSTANCES.
+        Returns 202 immediately; poll GET /review/status/{instance}/{project_id}/{mr_iid} for progress.
         """
+        cfg        = get_settings()
+        instance   = body.get("instance")
         project_id = body.get("project_id")
         mr_iid     = body.get("mr_iid")
         if not project_id or not mr_iid:
             raise HTTPException(status_code=400, detail="project_id and mr_iid required")
 
+        if not instance:
+            if len(cfg.gitlab_instances) == 1:
+                instance = next(iter(cfg.gitlab_instances))
+            else:
+                known = ", ".join(cfg.gitlab_instances) or "(none configured — check GITLAB_INSTANCES in .env)"
+                raise HTTPException(status_code=400, detail=f"instance required — one of: {known}")
+        try:
+            get_gitlab_client(instance)
+        except UnknownGitLabInstance as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
         mr_iid = int(mr_iid)
-        existing = _reviews.get(_rkey(project_id, mr_iid))
+        existing = _reviews.get(_rkey(instance, project_id, mr_iid))
         if existing and existing.status == "running":
             return JSONResponse({
                 "status": "already_in_progress",
@@ -339,11 +366,11 @@ def create_app() -> FastAPI:
                 "progress": existing.as_dict(),
             })
 
-        background_tasks.add_task(_run_review_bg, project_id, mr_iid, "")
+        background_tasks.add_task(_run_review_bg, instance, project_id, mr_iid, "")
         return JSONResponse({
             "status": "accepted",
             "mr_iid": mr_iid,
-            "status_url": f"/review/status/{project_id}/{mr_iid}",
+            "status_url": f"/review/status/{instance}/{project_id}/{mr_iid}",
         }, status_code=202)
 
     return app
@@ -351,16 +378,16 @@ def create_app() -> FastAPI:
 
 # ── Background review runner ──────────────────────────────────────────────────
 
-async def _run_review_bg(project_id: str | int, mr_iid: int, mr_title: str) -> None:
+async def _run_review_bg(instance: str, project_id: str | int, mr_iid: int, mr_title: str) -> None:
     """Background entry-point — wraps _run_review with error handling."""
     try:
-        await _run_review(project_id, mr_iid, mr_title)
+        await _run_review(instance, project_id, mr_iid, mr_title)
     except Exception as exc:
-        log.error("review.failed", mr=mr_iid, project=project_id, error=str(exc))
-        _fail(project_id, mr_iid, str(exc))
+        log.error("review.failed", instance=instance, mr=mr_iid, project=project_id, error=str(exc))
+        _fail(instance, project_id, mr_iid, str(exc))
 
 
-async def _run_review(project_id: str | int, mr_iid: int, mr_title: str = "") -> None:
+async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_title: str = "") -> None:
     """Register progress → fetch MR → run agents → post comments → mark done.
 
     Registration happens synchronously, before any `await`, so two background
@@ -373,7 +400,7 @@ async def _run_review(project_id: str | int, mr_iid: int, mr_title: str = "") ->
     coordinator = CoordinatorAgent()
     agent_names = [a.name for a in coordinator.agents]
 
-    if not _register(project_id, mr_iid, mr_title, agent_names):
+    if not _register(instance, project_id, mr_iid, mr_title, agent_names):
         return  # duplicate — already running
 
     # Everything from here on is the expensive part (GitLab fetch, cloning,
@@ -384,7 +411,7 @@ async def _run_review(project_id: str | int, mr_iid: int, mr_title: str = "") ->
     async with _review_semaphore:
         queue_wait_ms = int((time.monotonic() - queued_at) * 1000)
         if queue_wait_ms > 0:
-            log.info("review.dequeued", mr=mr_iid, project=project_id, queue_wait_ms=queue_wait_ms)
+            log.info("review.dequeued", instance=instance, mr=mr_iid, project=project_id, queue_wait_ms=queue_wait_ms)
 
         # Covers the whole gated review — GitLab fetch/clone included, not
         # just the coordinator's LLM/static-analysis stage — so the report's
@@ -392,7 +419,7 @@ async def _run_review(project_id: str | int, mr_iid: int, mr_title: str = "") ->
         review_started_at = datetime.now()
 
         cfg    = get_settings()
-        gitlab = get_gitlab_client()
+        gitlab = get_gitlab_client(instance)
 
         # Clean up any "in progress" note a previous run left dangling — e.g.
         # the process crashed/restarted mid-review, so its own try/finally
@@ -422,7 +449,7 @@ async def _run_review(project_id: str | int, mr_iid: int, mr_title: str = "") ->
         diff       = await gitlab.get_mr_diff(project_id, mr_iid)
         mr_title   = mr_title or mr_details.get("title", "")
 
-        if p := _reviews.get(_rkey(project_id, mr_iid)):
+        if p := _reviews.get(_rkey(instance, project_id, mr_iid)):
             p.mr_title = mr_title
 
         source_branch = mr_details.get("source_branch", "")
@@ -430,7 +457,7 @@ async def _run_review(project_id: str | int, mr_iid: int, mr_title: str = "") ->
         changed_files = get_changed_files(diff)
         file_diffs    = parse_diff(diff)
 
-        if p := _reviews.get(_rkey(project_id, mr_iid)):
+        if p := _reviews.get(_rkey(instance, project_id, mr_iid)):
             p.branch = source_branch
 
         try:
@@ -440,11 +467,11 @@ async def _run_review(project_id: str | int, mr_iid: int, mr_title: str = "") ->
             log.warning("review.project_lookup_failed", project=project_id, error=str(exc))
             project_name = str(project_id)
 
-        if p := _reviews.get(_rkey(project_id, mr_iid)):
+        if p := _reviews.get(_rkey(instance, project_id, mr_iid)):
             p.project_name = project_name
 
         report = ExecutionReport(
-            repository=project_name, branch=source_branch,
+            repository=project_name, branch=source_branch, instance=instance,
             project_id=project_id, project_name=project_name, mr_iid=mr_iid, mr_title=mr_title,
         )
         report.files_changed = len(changed_files)
@@ -503,8 +530,8 @@ async def _run_review(project_id: str | int, mr_iid: int, mr_title: str = "") ->
             report.started_at = review_started_at
             result = await coordinator.run(
                 ctx,
-                on_agent_start=lambda agent: _on_agent_start(project_id, mr_iid, agent),
-                on_agent_done=lambda agent, n: _on_agent_done(project_id, mr_iid, agent, n),
+                on_agent_start=lambda agent: _on_agent_start(instance, project_id, mr_iid, agent),
+                on_agent_done=lambda agent, n: _on_agent_done(instance, project_id, mr_iid, agent, n),
                 on_llm_request=report.on_llm_request,
                 on_analyzer_done=report.on_analyzer_done,
                 on_phase=report.on_phase,
@@ -520,7 +547,7 @@ async def _run_review(project_id: str | int, mr_iid: int, mr_title: str = "") ->
                 progress_note_id = None
 
             await gitlab.post_review(result, mr_details, get_path_map(diff))
-            _finish(project_id, mr_iid, result.total_issues, result.critical_count, result.high_count)
+            _finish(instance, project_id, mr_iid, result.total_issues, result.critical_count, result.high_count)
         except Exception as exc:
             report.status = "failed"
             report.error = str(exc)

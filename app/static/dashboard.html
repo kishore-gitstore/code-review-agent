@@ -169,7 +169,7 @@ function applyFilters(list) {
   return list.filter(r => {
     if (statusFilter && r.status !== statusFilter) return false;
     if (!q) return true;
-    const hay = `${r.project_id ?? ""} ${r.project_name ?? ""} ${r.mr_iid ?? ""} ${r.branch ?? ""} ${r.repository ?? ""}`.toLowerCase();
+    const hay = `${r.instance ?? ""} ${r.project_id ?? ""} ${r.project_name ?? ""} ${r.mr_iid ?? ""} ${r.branch ?? ""} ${r.repository ?? ""}`.toLowerCase();
     return hay.includes(q);
   });
 }
@@ -192,9 +192,10 @@ function render() {
   for (const r of list) {
     const tr = document.createElement("tr");
     if (r._live) tr.classList.add("live-row");
-    const projectCell = r.project_name
+    const projectLabel = r.project_name
       ? `${r.project_name} <span class="muted">(${r.project_id ?? "-"})</span>`
       : (r.project_id ?? "-");
+    const projectCell = r.instance ? `<span class="muted">${r.instance} ·</span> ${projectLabel}` : projectLabel;
     const duration = r._live ? liveDuration(r) : r.total_duration_s;
     tr.innerHTML = `
       <td>${projectCell}</td>
@@ -208,7 +209,7 @@ function render() {
       <td>${r._live ? '<span class="muted">-</span>' : (r.llm_requests_total ?? 0)}</td>
       <td>${r._live ? '<span class="muted">-</span>' : (r.static_analyzers_run ?? 0)}</td>
     `;
-    tr.onclick = () => r._live ? openLiveDetail(r.project_id, r.mr_iid) : openDetail(r._file);
+    tr.onclick = () => r._live ? openLiveDetail(r.instance, r.project_id, r.mr_iid) : openDetail(r._file);
     rows.appendChild(tr);
   }
 
@@ -276,15 +277,15 @@ async function openDetail(filename) {
   `;
 }
 
-async function openLiveDetail(projectId, mrIid) {
+async function openLiveDetail(instance, projectId, mrIid) {
   const panel = document.getElementById("detail");
   const body = document.getElementById("detail-body");
-  document.getElementById("detail-title").textContent = `${projectId} !${mrIid} — in progress`;
+  document.getElementById("detail-title").textContent = `${instance ? instance + " · " : ""}${projectId} !${mrIid} — in progress`;
   panel.style.display = "block";
   body.innerHTML = "Loading…";
   panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 
-  const res = await fetch(`/review/status/${encodeURIComponent(projectId)}/${mrIid}`);
+  const res = await fetch(`/review/status/${encodeURIComponent(instance)}/${encodeURIComponent(projectId)}/${mrIid}`);
   if (!res.ok) { body.innerHTML = "This review is no longer active."; return; }
   const d = await res.json();
 
