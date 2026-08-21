@@ -95,6 +95,7 @@
         <tr>
           <th data-key="project_id">Project</th>
           <th data-key="mr_iid">MR</th>
+          <th data-key="mr_author">Author</th>
           <th data-key="branch">Branch</th>
           <th data-key="model">Model</th>
           <th data-key="status">Status</th>
@@ -169,7 +170,7 @@ function applyFilters(list) {
   return list.filter(r => {
     if (statusFilter && r.status !== statusFilter) return false;
     if (!q) return true;
-    const hay = `${r.instance ?? ""} ${r.project_id ?? ""} ${r.project_name ?? ""} ${r.mr_iid ?? ""} ${r.branch ?? ""} ${r.repository ?? ""}`.toLowerCase();
+    const hay = `${r.instance ?? ""} ${r.project_id ?? ""} ${r.project_name ?? ""} ${r.mr_iid ?? ""} ${r.mr_author ?? ""} ${r.branch ?? ""} ${r.repository ?? ""}`.toLowerCase();
     return hay.includes(q);
   });
 }
@@ -200,6 +201,7 @@ function render() {
     tr.innerHTML = `
       <td>${projectCell}</td>
       <td>${r.mr_iid != null ? "!" + r.mr_iid : "-"}</td>
+      <td>${r.mr_author || "<span class=\"muted\">-</span>"}</td>
       <td>${r.branch || "<span class=\"muted\">-</span>"}</td>
       <td class="muted">${r.model ?? "-"}</td>
       <td>${statusBadge(r)}</td>
@@ -263,7 +265,7 @@ async function openDetail(filename) {
         <td>${a.findings}</td><td>${(a.duration_ms / 1000).toFixed(2)}s</td></tr>`).join("");
 
   body.innerHTML = `
-    <p class="muted">${d.repository} · ${d.branch} · ${d.model} · ${d.execution_mode}</p>
+    <p class="muted">${d.repository} · ${d.branch} · ${d.mr_author ? "by " + d.mr_author + " · " : ""}${d.model} · ${d.execution_mode}</p>
     <table>
       <thead><tr><th>#</th><th>Agent</th><th>File</th><th>Chunk</th><th>Start</th><th>End</th><th>Duration</th><th>Status</th></tr></thead>
       <tbody>${llmRows || '<tr><td colspan="8" class="muted">No LLM requests recorded</td></tr>'}</tbody>
@@ -297,7 +299,7 @@ async function openLiveDetail(instance, projectId, mrIid) {
   ].join("");
 
   body.innerHTML = `
-    <p class="muted">${d.mr_title || ""} · started ${fmtTime(d.started_at)}</p>
+    <p class="muted">${d.mr_title || ""}${d.mr_author ? " · by " + d.mr_author : ""} · started ${fmtTime(d.started_at)}</p>
     <table>
       <thead><tr><th>Agent</th><th>Status</th></tr></thead>
       <tbody>${agentRows || '<tr><td colspan="2" class="muted">No agents registered</td></tr>'}</tbody>

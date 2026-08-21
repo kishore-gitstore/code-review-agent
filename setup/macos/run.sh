@@ -2,7 +2,9 @@
 # run.sh — set up (if needed) and start the Code Review Agent service directly,
 # without Docker. Creates/reuses a venv, installs deps, loads .env, runs main.py.
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
+# This script lives in setup/macos/ -- everything it operates on (venv, .env,
+# requirements.txt, main.py) lives at the repo root, two directories up.
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 VENV_DIR="venv"
 
@@ -33,9 +35,7 @@ set -a
 source .env
 set +a
 
-# Interactive/dev usage — live-reload on file changes. The systemd unit
-# (code-review-agent.service) runs main.py directly instead of this script,
-# so it does NOT set this and stays in stable no-reload mode.
+# Interactive/dev usage — live-reload on file changes.
 export UVICORN_RELOAD=true
 
 exec python main.py

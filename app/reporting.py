@@ -85,6 +85,7 @@ class ExecutionReport:
         project_name: str = "",
         mr_iid: int | None = None,
         mr_title: str = "",
+        mr_author: str = "",
     ):
         self.repository = repository
         self.branch = branch
@@ -93,6 +94,7 @@ class ExecutionReport:
         self.project_name = project_name
         self.mr_iid = mr_iid
         self.mr_title = mr_title
+        self.mr_author = mr_author
         self.model = get_active_model_label()
         self.execution_mode = get_execution_policy().mode
 
@@ -152,6 +154,7 @@ class ExecutionReport:
             "project_name": self.project_name,
             "mr_iid": self.mr_iid,
             "mr_title": self.mr_title,
+            "mr_author": self.mr_author,
             "model": self.model,
             "execution_mode": self.execution_mode,
             "status": self.status,
@@ -203,6 +206,8 @@ class ExecutionReport:
         if self.mr_iid is not None:
             mr_line = f"!{self.mr_iid}" + (f" — {self.mr_title}" if self.mr_title else "")
             print(f"Merge Request        : {mr_line}")
+        if self.mr_author:
+            print(f"Author               : {self.mr_author}")
         print(f"Repository           : {self.repository}")
         print(f"Branch               : {self.branch}")
         print(f"Model                : {self.model}")

@@ -170,40 +170,91 @@ setup (e.g. a non-NVIDIA GPU).
 
 ## Quick Start
 
-### 1. Install Ollama & pull DeepSeek
+### One-command setup
+
+Setup/run/service scripts live under [`setup/`](setup/), one folder per OS —
+each folder is self-contained, so you only ever need the one matching your
+machine:
+
+```
+setup/
+├── windows/   setup.ps1, run.ps1, install-service.ps1, uninstall-service.ps1
+├── linux/     setup.sh, run.sh, install-service.sh, uninstall-service.sh, code-review-agent.service
+└── macos/     setup.sh, run.sh
+```
+
+Each `setup.*` checks for git/Python 3.12/Ollama, installs whichever are
+missing via the OS package manager (`apt`/`brew`/`winget`), creates the
+venv, installs `requirements.txt`, and bootstraps `.env` from
+`.env.example`. Once `.env` exists, it reads `LLM_PROVIDER` from it and only
+installs/pulls Ollama when that's actually the configured provider.
 
 ```bash
-# macOS / Linux
-curl -fsSL https://ollama.com/install.sh | sh
+# Ubuntu / Debian
+git clone https://github.com/your-org/code-review-agent.git
+cd code-review-agent
+./setup/linux/setup.sh
+```
 
-# Pull the model (choose one)
+```bash
+# macOS
+git clone https://github.com/your-org/code-review-agent.git
+cd code-review-agent
+./setup/macos/setup.sh
+```
+
+```powershell
+# Windows (PowerShell)
+git clone https://github.com/your-org/code-review-agent.git
+cd code-review-agent
+.\setup\windows\setup.ps1
+```
+
+Useful flags: `--no-system`/`-NoSystem` (skip installing git/Python/Ollama —
+just venv + pip + `.env`), `--no-ollama`/`-NoOllama`, `--model`/`-Model
+<name>` (Ollama model to pull), `--static-langs`/`-StaticLangs
+python,js,dotnet,rust,cpp,java` (also install the matching linter from the
+[Static Analysis Tools](#static-analysis-tools) table).
+
+After setup finishes, edit `.env` — at minimum set `GITLAB_INSTANCES` (see
+[Multiple GitLab Servers](#multiple-gitlab-servers)) and whichever provider
+key `LLM_PROVIDER` needs — then start the server:
+
+```bash
+./setup/linux/run.sh    # Ubuntu / Debian
+./setup/macos/run.sh    # macOS
+```
+
+```powershell
+.\setup\windows\run.ps1   # Windows
+```
+
+Server starts at http://localhost:8000.
+
+### Manual setup
+
+If you'd rather do it by hand instead of running the `setup/<os>/setup.*` script:
+
+```bash
+# 1. Install Ollama & pull a model (skip if using a cloud LLM_PROVIDER)
+curl -fsSL https://ollama.com/install.sh | sh   # macOS/Linux; on macOS `brew install ollama` also works
 ollama pull deepseek-coder-v2      # recommended — 16GB RAM
 ollama pull deepseek-r1:7b         # lighter — 8GB RAM
 ollama pull codellama:13b          # alternative
 ollama pull qwen3-coder:latest     # newest Qwen coder release, strong agentic coding
-```
 
-### 2. Clone & configure
-
-```bash
+# 2. Clone & configure
 git clone https://github.com/your-org/code-review-agent.git
 cd code-review-agent
-
 cp .env.example .env
 # Edit .env — set GITLAB_INSTANCES (see "Multiple GitLab Servers" below)
-```
 
-### 3. Install Python dependencies
-
-```bash
+# 3. Install Python dependencies
 python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+source venv/bin/activate          # Windows: venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-```
 
-### 4. Run the server
-
-```bash
+# 4. Run the server
 python main.py
 # Server starts at http://localhost:8000
 ```
@@ -255,16 +306,16 @@ Progress and report endpoints are namespaced by instance too:
 ## Run as a systemd Service (Linux)
 
 For a persistent deployment that survives SSH disconnects, crashes, and
-reboots, instead of running `./run.sh` in a terminal:
+reboots, instead of running `./setup/linux/run.sh` in a terminal:
 
 ```bash
 # 1. Run it once by hand first — creates the venv and confirms it starts.
-./run.sh
+./setup/linux/run.sh
 # Ctrl+C once you see "Application startup complete."
 
 # 2. Install + start the service (fills in User/WorkingDirectory automatically
 #    from this machine — no manual editing of code-review-agent.service needed)
-sudo ./install-service.sh
+sudo ./setup/linux/install-service.sh
 
 # 3. Check status / logs
 sudo systemctl status code-review-agent
@@ -289,12 +340,53 @@ change, `sudo systemctl restart code-review-agent`.
 **Uninstall:**
 
 ```bash
-sudo ./uninstall-service.sh
+sudo ./setup/linux/uninstall-service.sh
 ```
 
 Stops and disables the service and removes the unit file from
 `/etc/systemd/system/` — leaves the venv, `.env`, and the rest of the repo
 untouched.
+
+---
+
+## Run as a Windows Service
+
+For a persistent deployment that survives logout, crashes, and reboots,
+instead of leaving `.\setup\windows\run.ps1` running in a terminal. Uses
+[NSSM](https://nssm.cc/) (installed automatically via `winget` if missing)
+to wrap `venv\Scripts\python.exe main.py` as a real Windows service — the
+native equivalent of the systemd unit above.
+
+```powershell
+# 1. Run it once by hand first — creates the venv and confirms it starts.
+.\setup\windows\run.ps1
+# Ctrl+C once you see "Application startup complete."
+
+# 2. Install + start the service (elevated/Administrator PowerShell)
+.\setup\windows\install-service.ps1
+
+# 3. Check status / logs
+Get-Service code-review-agent
+Get-Content logs\service.out.log -Tail 50 -Wait
+```
+
+Like the systemd unit, this runs `main.py` directly (no reload — reload
+doesn't work on Windows for this app anyway, see `run.ps1`'s comment on
+uvicorn forcing `WindowsSelectorEventLoopPolicy`, which breaks the
+`nvidia-smi`/static-analysis subprocess calls made on every run). It's
+configured to start on boot and restart automatically 60 seconds after any
+non-explicit stop. To pick up a code change: `Restart-Service
+code-review-agent`. Re-running `.\setup\windows\install-service.ps1` is
+safe — it stops/removes any existing service of the same name first.
+
+**Uninstall:**
+
+```powershell
+.\setup\windows\uninstall-service.ps1
+```
+
+Stops and removes the service — leaves the venv, `.env`, and the rest of the
+repo untouched.
 
 ---
 
@@ -445,6 +537,10 @@ code-review-agent/
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
+├── setup/                          # Per-OS setup/run/service scripts (see "One-command setup" above)
+│   ├── windows/                    # setup.ps1, run.ps1, install-service.ps1 (NSSM), uninstall-service.ps1
+│   ├── linux/                      # setup.sh, run.sh, install-service.sh (systemd), uninstall-service.sh, code-review-agent.service
+│   └── macos/                      # setup.sh, run.sh
 ├── app/
 │   ├── settings.py                # Pydantic settings (reads .env)
 │   ├── server.py                  # FastAPI app + webhook handler

@@ -2,11 +2,11 @@
 # uninstall-service.sh — stops and removes the code-review-agent systemd
 # service installed by install-service.sh. Only touches the systemd unit —
 # the venv, .env, and repo files are left alone. Run with sudo:
-# sudo ./uninstall-service.sh
+# sudo ./setup/linux/uninstall-service.sh
 set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "Run this with sudo: sudo ./uninstall-service.sh" >&2
+    echo "Run this with sudo: sudo ./setup/linux/uninstall-service.sh" >&2
     exit 1
 fi
 

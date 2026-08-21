@@ -47,6 +47,7 @@ class ReviewProgress:
     project_id:     str | int
     mr_iid:         int
     mr_title:       str = ""
+    mr_author:      str = ""
     project_name:   str = ""
     branch:         str = ""
     status:         str = "running"        # running | done | error
@@ -71,6 +72,7 @@ class ReviewProgress:
             "project_id":     self.project_id,
             "mr_iid":         self.mr_iid,
             "mr_title":       self.mr_title,
+            "mr_author":      self.mr_author,
             "project_name":   self.project_name,
             "branch":         self.branch,
             "status":         self.status,
@@ -448,9 +450,12 @@ async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_titl
         mr_details = await gitlab.get_mr_details(project_id, mr_iid)
         diff       = await gitlab.get_mr_diff(project_id, mr_iid)
         mr_title   = mr_title or mr_details.get("title", "")
+        mr_author_info = mr_details.get("author", {}) or {}
+        mr_author  = mr_author_info.get("name") or mr_author_info.get("username", "unknown")
 
         if p := _reviews.get(_rkey(instance, project_id, mr_iid)):
-            p.mr_title = mr_title
+            p.mr_title  = mr_title
+            p.mr_author = mr_author
 
         source_branch = mr_details.get("source_branch", "")
         head_sha      = (mr_details.get("diff_refs") or {}).get("head_sha", "")
@@ -473,6 +478,7 @@ async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_titl
         report = ExecutionReport(
             repository=project_name, branch=source_branch, instance=instance,
             project_id=project_id, project_name=project_name, mr_iid=mr_iid, mr_title=mr_title,
+            mr_author=mr_author,
         )
         report.files_changed = len(changed_files)
         report.lines_added   = sum(fd.added_lines for fd in file_diffs)

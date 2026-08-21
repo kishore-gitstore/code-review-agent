@@ -7,6 +7,13 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+if sys.platform == "win32":
+    # uvicorn --reload resets Windows back to SelectorEventLoop, which can't
+    # spawn subprocesses (asyncio.create_subprocess_exec) — needed here for
+    # nvidia-smi hardware detection and the static-analysis linters.
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 import uvicorn
 from app.server import create_app
 
