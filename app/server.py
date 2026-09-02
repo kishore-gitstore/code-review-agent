@@ -15,7 +15,7 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
@@ -99,7 +99,11 @@ def _rkey(instance: str, project_id: str | int, mr_iid: int) -> str:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    # Naive local time, matching reporting.py/coordinator.py's datetime.now()
+    # usage — the dashboard's fmtTime() displays these strings verbatim with
+    # no timezone conversion, so every timestamp source must agree on local
+    # time or the "live" and "finished" rows show different clocks.
+    return datetime.now().isoformat()
 
 
 def _register(instance: str, project_id: str | int, mr_iid: int, mr_title: str, agent_names: list[str]) -> bool:
