@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
+import re
 import structlog
 import httpx
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -260,16 +261,8 @@ class GitLabClient:
         if not comment.line:
             return False
 
-        body = (
-            f"{_EMOJI[comment.severity]} **[{comment.severity.upper()}] {comment.title}**\n"
-            f"*Agent: {comment.agent}*\n\n"
-            f"{comment.description}"
-        )
-        if comment.suggestion:
-            body += f"\n\n**Suggestion:**\n```\n{comment.suggestion}\n```"
-
         payload = {
-            "body": body,
+            "body": _build_inline_body(comment, applicable=get_settings().post_fix_suggestions),
             "position": {
                 "base_sha":      base_sha,
                 "head_sha":      head_sha,
@@ -355,6 +348,51 @@ def _with_token(clone_url: str, token: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
+def _code_fence(code: str) -> str:
+    """Backtick fence long enough that `code` can't close it early — GitLab
+    (like CommonMark) accepts 4+ backticks when the body itself contains ```."""
+    longest = max((len(m) for m in re.findall(r"`{3,}", code)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def _build_inline_body(comment: ReviewComment, applicable: bool = True) -> str:
+    """
+    Markdown for one inline diff comment. When the finding carries a CodeFix
+    it's rendered as a GitLab suggestion block — the MR author gets an
+    "Apply suggestion" button that commits the replacement directly:
+
+        ```suggestion:-1+0
+        <replacement for the commented line and the 1 line above it>
+        ```
+
+    The -N+M offsets are relative to the commented line (comment.line), which
+    BaseAgent._parse_fix() guarantees lies inside the fix range. With
+    `applicable` False (POST_FIX_SUGGESTIONS=false) the same code is shown
+    read-only. Without a fix, the prose `suggestion` is shown as before.
+    """
+    body = (
+        f"{_EMOJI[comment.severity]} **[{comment.severity.upper()}] {comment.title}**\n"
+        f"*Agent: {comment.agent}*\n\n"
+        f"{comment.description}"
+    )
+    fix = comment.fix
+    if fix is not None and comment.line is not None and fix.covers(comment.line):
+        fence = _code_fence(fix.replacement)
+        span  = f"line {fix.start_line}" if fix.line_count == 1 else f"lines {fix.start_line}–{fix.end_line}"
+        if applicable:
+            above = comment.line - fix.start_line
+            below = fix.end_line - comment.line
+            body += (
+                f"\n\n**Suggested fix** (replaces {span} — click *Apply suggestion* to commit it):\n"
+                f"{fence}suggestion:-{above}+{below}\n{fix.replacement}\n{fence}"
+            )
+        else:
+            body += f"\n\n**Suggested fix** (replaces {span}):\n{fence}\n{fix.replacement}\n{fence}"
+    elif comment.suggestion:
+        body += f"\n\n**Suggestion:**\n```\n{comment.suggestion}\n```"
+    return body
+
+
 def _build_summary(result: ReviewResult, failed_inline: list[ReviewComment]) -> str:
     header = (
         f"## 🤖 Automated Code Review\n\n"
@@ -364,8 +402,15 @@ def _build_summary(result: ReviewResult, failed_inline: list[ReviewComment]) -> 
         f"🔴 {result.critical_count} critical · "
         f"🟠 {result.high_count} high · "
         f"🟡 {result.medium_count} medium · "
-        f"🔵 {result.low_count} low\n"
+        f"🔵 {result.low_count} low"
     )
+    if result.fix_count:
+        header += f" · 🛠️ {result.fix_count} with a ready-to-apply fix"
+    if result.degraded:
+        # Counts are a floor, not a tally — some agents never reported. The
+        # reason is already spelled out in result.summary's banner.
+        header += " · ⚠️ incomplete review"
+    header += "\n"
 
     sections = []
 

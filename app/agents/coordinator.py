@@ -24,6 +24,15 @@ from .documentation_agent  import DocumentationAgent
 
 log = structlog.get_logger(__name__)
 
+# Prepended to the summary whenever an agent's LLM request failed. The
+# findings that follow are then a floor, not a tally, and the reader has to be
+# told that — otherwise "0 issues" from a dead LLM reads as an approval.
+_DEGRADED_BANNER = (
+    "⚠️ **This review is incomplete — {failed} of {total} model request(s) failed.** "
+    "Only the agents that ran are represented below; treat a missing finding as "
+    "unknown, not as safe."
+)
+
 _SEV_ORDER = {
     Severity.critical: 0,
     Severity.high:     1,
@@ -101,7 +110,14 @@ class CoordinatorAgent:
         # fired at once but queued somewhere downstream".
         review_gate = asyncio.Semaphore(self._agent_concurrency)
 
+        # Tallied onto the ReviewResult: agent.review() handles its own LLM
+        # errors and returns no findings, so without counting them here a dead
+        # LLM is indistinguishable from a clean MR.
+        agent_requests = 0
+        agent_failures = 0
+
         async def _review_one(agent, fd) -> list[ReviewComment]:
+            nonlocal agent_requests, agent_failures
             async with review_gate:
                 req_started = datetime.now()
                 failed = False
@@ -114,6 +130,8 @@ class CoordinatorAgent:
                     ctx, fd.full_diff, static_by_file.get(fd.path, []),
                     file_path=fd.path, on_error=_mark_failed,
                 )
+                agent_requests += 1
+                agent_failures += int(failed)
                 if on_llm_request:
                     on_llm_request(agent.name, fd.path, req_started, datetime.now(), not failed)
                 return comments
@@ -163,7 +181,13 @@ class CoordinatorAgent:
         if on_phase:
             on_phase("merge", int((time.monotonic() - phase_started) * 1000))
 
-        summary = await self._summarise(ctx, sorted_, on_llm_request)
+        summary, summary_failed = await self._summarise(
+            ctx, sorted_, on_llm_request, degraded=agent_failures > 0
+        )
+        if agent_failures:
+            summary = _DEGRADED_BANNER.format(
+                failed=agent_failures, total=agent_requests
+            ) + "\n\n" + summary
 
         result = ReviewResult(
             mr_iid=ctx.mr_iid,
@@ -171,10 +195,17 @@ class CoordinatorAgent:
             summary=summary,
             comments=sorted_,
             static_analysis_notes=static_notes,
+            agent_requests=agent_requests,
+            agent_failures=agent_failures,
+            summary_failed=summary_failed,
         )
         result.compute_counts()
+        if result.degraded:
+            log.error("coordinator.degraded", mr=ctx.mr_iid, agent_requests=agent_requests,
+                      agent_failures=agent_failures, summary_failed=summary_failed)
         log.info("coordinator.done", mr=ctx.mr_iid, total=result.total_issues,
                  critical=result.critical_count, high=result.high_count,
+                 degraded=result.degraded,
                  duration_ms=int((time.monotonic() - started) * 1000))
         return result
 
@@ -203,10 +234,18 @@ class CoordinatorAgent:
         return [c for c in comments if _SEV_ORDER[c.severity] <= threshold]
 
     def _dedup(self, comments: list[ReviewComment]) -> list[ReviewComment]:
+        """Collapse same (file, line, title) findings from different agents.
+        Higher severity wins; on a tie, the one carrying an applicable code
+        fix wins so a one-click fix isn't lost to a fix-less duplicate."""
         seen: dict[tuple, ReviewComment] = {}
         for c in comments:
             key = (c.file_path, c.line, c.title.lower()[:50])
-            if key not in seen or _SEV_ORDER[c.severity] < _SEV_ORDER[seen[key].severity]:
+            prev = seen.get(key)
+            if (
+                prev is None
+                or _SEV_ORDER[c.severity] < _SEV_ORDER[prev.severity]
+                or (c.severity == prev.severity and c.fix is not None and prev.fix is None)
+            ):
                 seen[key] = c
         return list(seen.values())
 
@@ -215,12 +254,26 @@ class CoordinatorAgent:
         ctx: MRContext,
         comments: list[ReviewComment],
         on_llm_request: Optional[Callable[[str, str, datetime, datetime, bool], None]] = None,
-    ) -> str:
+        *,
+        degraded: bool = False,
+    ) -> tuple[str, bool]:
+        """Returns (summary_markdown, summary_llm_failed).
+
+        `degraded` means some agents never reported, so an empty findings list
+        is not evidence of a clean MR and must not be summarised as one.
+        """
         if not comments:
-            return "✅ **No significant issues found.** This MR looks good to merge."
+            if degraded:
+                return (
+                    "**No findings were recorded, and the review did not complete — "
+                    "this is not an all-clear.**",
+                    False,
+                )
+            return ("✅ **No significant issues found.** This MR looks good to merge.", False)
 
         findings = "\n".join(
             f"- [{c.severity.upper()}] {c.agent}: {c.title} ({c.file_path}:{c.line or 'file'})"
+            + (" — one-click fix attached" if c.fix else "")
             for c in comments[:30]
         )
         system = (
@@ -246,7 +299,7 @@ Write a 3–5 sentence summary covering:
         started = datetime.now()
         succeeded = True
         try:
-            return await get_llm_client().generate(system, user)
+            return (await get_llm_client().generate(system, user), False)
         except Exception as exc:
             succeeded = False
             log.error("coordinator.summary.error", error=str(exc))
@@ -254,7 +307,8 @@ Write a 3–5 sentence summary covering:
             return (
                 f"🔍 Found **{len(comments)} issue(s)**: "
                 f"{counts[Severity.critical]} critical, {counts[Severity.high]} high, "
-                f"{counts[Severity.medium]} medium, {counts[Severity.low]} low."
+                f"{counts[Severity.medium]} medium, {counts[Severity.low]} low.",
+                True,
             )
         finally:
             if on_llm_request:

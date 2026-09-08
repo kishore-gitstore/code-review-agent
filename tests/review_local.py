@@ -24,6 +24,11 @@ from pathlib import Path
 # Allow running from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Output below is emoji-heavy and this script is routinely piped or
+# redirected, where Windows stdout is cp1252 and the first print() would die.
+from app.utils.console import force_utf8_streams
+force_utf8_streams()
+
 from app.agents.coordinator import CoordinatorAgent
 from app.reporting          import ExecutionReport
 from app.utils.models       import MRContext
@@ -144,7 +149,8 @@ async def main():
             print()
 
         if result.comments:
-            print(f"Found {result.total_issues} issue(s):\n")
+            fixes = f", {result.fix_count} with a ready fix" if result.fix_count else ""
+            print(f"Found {result.total_issues} issue(s){fixes}:\n")
             sev_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}
             for c in result.comments:
                 icon = sev_icon.get(c.severity, "⚪")
@@ -152,7 +158,16 @@ async def main():
                 print(f"{icon} [{c.severity.upper()}] {c.title}")
                 print(f"   📍 {loc}  (agent: {c.agent})")
                 print(f"   {c.description}")
-                if c.suggestion:
+                if c.fix:
+                    span = (f"line {c.fix.start_line}" if c.fix.line_count == 1
+                            else f"lines {c.fix.start_line}-{c.fix.end_line}")
+                    print(f"   🛠️  Fix — replace {span} with:")
+                    if c.fix.replacement:
+                        for code_line in c.fix.replacement.splitlines():
+                            print(f"        {code_line}")
+                    else:
+                        print("        (delete these lines)")
+                elif c.suggestion:
                     print(f"   💡 {c.suggestion}")
                 print()
         else:
@@ -161,10 +176,9 @@ async def main():
         print(f"\n❌ Review did not complete: {report.error}")
 
     # Requirement: the execution summary prints even on failure/cancellation.
-    report.print_console()
-    report.log_summary()
-    json_path = report.save_json()
-    print(f"\n📄 Execution stats saved to {json_path}")
+    json_path = report.persist_and_render()
+    if json_path:
+        print(f"\n📄 Execution stats saved to {json_path}")
 
     if report.status != "success":
         sys.exit(1)

@@ -88,3 +88,59 @@ def test_list_reports_skips_unreadable_files(tmp_path):
         reports = reporting.list_reports()
 
     assert len(reports) == 1
+
+
+# ── dashboard payload: summary_dict() contents and list_reports() slimming ────
+
+def _report_with_result():
+    from datetime import datetime, timedelta
+    from app.utils.models import CodeFix, ReviewComment, ReviewResult, Severity
+
+    report = reporting.ExecutionReport(
+        repository="g/r", branch="feature/x", instance="gl", project_id="g/r",
+        project_name="g/r", mr_iid=7, mr_title="Add x", mr_author="alice",
+        mr_url="https://gitlab.example.com/g/r/-/merge_requests/7",
+    )
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    report.on_llm_request("security", "a.py", t0, t0 + timedelta(seconds=2), True)
+    report.on_llm_request("security", "b.py", t0, t0 + timedelta(seconds=4), False)
+    report.on_llm_request("summary", "-", t0, t0 + timedelta(seconds=1), True)
+    result = reporting_result = ReviewResult(mr_iid=7, project_id="g/r", summary="🔴 Request Changes", comments=[
+        ReviewComment(agent="security", severity=Severity.critical, file_path="a.py", line=3,
+                      title="SQLi", description="d", fix=CodeFix(start_line=3, end_line=3, replacement="x")),
+        ReviewComment(agent="code_quality", severity=Severity.low, file_path="b.py", line=None,
+                      title="Naming", description="d"),
+    ])
+    result.compute_counts()
+    report.result = result
+    report.started_at, report.finished_at, report.status = t0, t0 + timedelta(seconds=9), "success"
+    return report
+
+
+def test_summary_dict_carries_findings_verdict_and_agent_stats():
+    d = _report_with_result().summary_dict()
+    assert d["summary"] == "🔴 Request Changes"
+    assert d["mr_url"].endswith("/merge_requests/7")
+    assert d["ai_fixes"] == 1
+    assert [c["title"] for c in d["comments"]] == ["SQLi", "Naming"]
+    assert d["comments"][0]["fix"] == {"start_line": 3, "end_line": 3, "replacement": "x"}
+    assert d["comments"][0]["severity"] == "critical"   # enum serialised as its value, not repr
+    assert d["agent_stats"]["security"] == {"requests": 2, "failed": 1, "total_s": 6.0}
+    assert d["findings_by_agent"] == {"security": 1, "code_quality": 1}
+    assert d["findings_by_file"] == {"a.py": 1, "b.py": 1}
+    json.dumps(d)  # save_json() relies on the dict being serialisable as-is
+
+
+def test_list_reports_is_slim_by_default_but_detail_read_is_full(tmp_path):
+    with patch.object(reporting, "REPORTS_DIR", tmp_path):
+        path = _report_with_result().save_json()
+        [slim] = reporting.list_reports()
+        full = reporting.read_report(path.name)
+        [unslim] = reporting.list_reports(slim=False)
+
+    assert "comments" not in slim and "llm_requests" not in slim
+    assert slim["total_issues"] == 2
+    assert slim["agent_stats"]["security"]["requests"] == 2
+    assert len(full["comments"]) == 2 and len(full["llm_requests"]) == 3
+    assert len(unslim["comments"]) == 2
+

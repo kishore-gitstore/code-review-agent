@@ -63,6 +63,20 @@ if this MR introduced it. File-level findings (no specific line) are always
 kept. This matches how the LLM agents already behave, since they only ever see
 the diff chunk, never the whole file.
 
+**Ready-to-apply fixes, not just advice.** Each finding can carry a concrete
+code fix — a line range plus the replacement source — in addition to the prose
+recommendation. On GitLab that fix is posted as a native
+[suggestion block](https://docs.gitlab.com/ee/user/project/merge_requests/reviews/suggestions.html)
+inside the inline comment, so the MR author gets an **Apply suggestion** button
+that commits the change in one click; no copy-pasting from a comment. To keep
+that button safe to press, a fix is only kept when it is small (≤ 40 lines),
+covers the reported line, and stays within the lines the model was actually
+shown in the diff — anything else is dropped and the finding falls back to
+the prose suggestion. The diff is sent to the model with explicit new-file
+line numbers so the range is anchored exactly. `POST_FIX_SUGGESTIONS=false`
+renders fixes as read-only code blocks instead; the local CLI prints them
+under each finding.
+
 ---
 
 ## Prerequisites
@@ -437,6 +451,40 @@ when exactly one instance is configured.
 
 ---
 
+## Dashboard
+
+Open `http://<host>:8000/dashboard` for a live view of everything the agent has
+reviewed. It is a single self-contained page (no CDN or external calls, so it
+works on an air-gapped server) fed by `/api/reports` and `/review/active`.
+
+- **Filters in one row** — date range (24h / 7d / 30d / 90d / all), GitLab
+  instance, project, status and free-text search. Every figure, chart and table
+  below re-computes against the same slice, and the filters live in the URL so
+  a view can be bookmarked or shared.
+- **Key figures** — reviews, issues found (with severity breakdown), fixes ready
+  to apply, median review time, LLM request success rate and failed reviews,
+  each with a change versus the previous period of the same length.
+- **Charts** — issues over time by severity, reviews over time (failures
+  highlighted), median review time trend, findings by agent, LLM time per
+  request by agent, and hotspot files. Hover any mark for exact values; every
+  chart has a **Table** toggle with the same numbers for screen readers,
+  copy-paste, or when colour alone isn't enough.
+- **Reviews table** — sortable, with in-progress reviews pinned on top showing
+  agent progress. MR numbers link straight to GitLab.
+- **Review detail** — click a row for the verdict, where the time went
+  (static analysis / LLM / merge), severity mix, and every finding with its
+  description, suggestion and ready-to-apply fix. Filter findings by severity
+  or agent; expand *Execution details* for the per-request LLM table and
+  analyzer runs. Deep-linkable via `#report=<file>`.
+- **Themes** — follows the OS light/dark setting; the ◐ button pins a theme per
+  browser, and `?theme=light|dark` forces one (handy for screenshots).
+
+Reports are the JSON files `app/reporting.py` writes under `reports/` after
+every review (webhook-triggered or local CLI), so the dashboard needs no
+database — delete a file and it disappears from the dashboard.
+
+---
+
 ## Configuration Reference (`.env`)
 
 | Variable                  | Default                     | Description                              |
@@ -453,6 +501,7 @@ when exactly one instance is configured.
 | `MIN_SEVERITY_TO_COMMENT` | `low`                       | Only post issues at or above this level  |
 | `POST_INLINE_COMMENTS`    | `true`                      | Post per-line diff comments              |
 | `POST_SUMMARY_COMMENT`    | `true`                      | Post a top-level summary comment         |
+| `POST_FIX_SUGGESTIONS`    | `true`                      | Post code fixes as GitLab *Apply suggestion* blocks (one-click commit); `false` shows them as read-only code |
 | `ENABLE_CODE_QUALITY`     | `true`                      | Toggle Code Quality agent                |
 | `ENABLE_SECURITY`         | `true`                      | Toggle Security agent                    |
 | `ENABLE_PERFORMANCE`      | `true`                      | Toggle Performance agent                 |
@@ -543,7 +592,10 @@ code-review-agent/
 │   └── macos/                      # setup.sh, run.sh
 ├── app/
 │   ├── settings.py                # Pydantic settings (reads .env)
-│   ├── server.py                  # FastAPI app + webhook handler
+│   ├── server.py                  # FastAPI app + webhook handler + dashboard API
+│   ├── reporting.py               # Execution report: console table, structlog, reports/*.json
+│   ├── static/
+│   │   └── dashboard.html         # Self-contained dashboard (served at /dashboard)
 │   ├── agents/
 │   │   ├── base_agent.py          # Abstract base + JSON parser
 │   │   ├── coordinator.py         # Orchestrator
@@ -576,6 +628,8 @@ code-review-agent/
 │       └── process_runner.py      # Shared async subprocess runner (analyzers + hardware detection)
 ├── tests/
 │   ├── test_agents.py
+│   ├── test_code_fixes.py         # applicable fixes: parsing, validation, GitLab suggestion rendering
+│   ├── test_reporting.py          # report JSON payload + dashboard read-side (path traversal guard)
 │   ├── test_coordinator.py
 │   ├── test_diff_parser.py
 │   ├── test_static_analysis.py

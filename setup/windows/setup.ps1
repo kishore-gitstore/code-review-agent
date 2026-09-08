@@ -37,6 +37,17 @@ Set-Location -Path (Join-Path $PSScriptRoot "..\..")
 
 function Log($msg) { Write-Host "==> $msg" }
 
+function Assert-LastExitCode($what) {
+    # $ErrorActionPreference = "Stop" does NOT apply to native executables
+    # (python, pip, winget) in Windows PowerShell 5.1 -- a failing exe just
+    # sets $LASTEXITCODE and the script carries on. Without this check a
+    # failed pip install still ended in "Setup complete."
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "$what failed (exit code $LASTEXITCODE). Fix the error above and re-run this script."
+        exit 1
+    }
+}
+
 function Test-Command($name) {
     return [bool](Get-Command $name -ErrorAction SilentlyContinue)
 }
@@ -158,16 +169,40 @@ if ($StaticLangs) {
 }
 
 # -- Python venv + deps ---------------------------------------
-if (-not (Test-Path "venv")) {
+# A venv\ folder that merely exists is not proof it works. A half-copied or
+# stale one (e.g. Scripts\python.exe present but pyvenv.cfg missing -- the
+# launcher then dies with "failed to locate pyvenv.cfg"; or pyvenv.cfg
+# pointing at a Python that is no longer installed -- "No Python at ...")
+# used to sail through a bare Test-Path check, and every pip step after it
+# failed. So probe the venv's own interpreter and rebuild when it won't run.
+# venvs are machine-specific: never copy one between machines -- let this
+# script create it locally.
+$venvPython = "venv\Scripts\python.exe"
+$venvOk = $false
+if (Test-Path "venv") {
+    if ((Test-Path "venv\pyvenv.cfg") -and (Test-Path $venvPython)) {
+        & $venvPython -c "import sys"
+        if ($LASTEXITCODE -eq 0) { $venvOk = $true }
+    }
+    if (-not $venvOk) {
+        Write-Warning "Existing venv\ is broken or incomplete (missing pyvenv.cfg, or its python.exe won't start) - recreating it."
+    }
+}
+if (-not $venvOk) {
     Log "Creating virtual environment..."
-    python -m venv venv
+    # --clear wipes whatever is left of a broken venv first; a no-op on a
+    # fresh directory.
+    python -m venv --clear venv
+    Assert-LastExitCode "Creating the virtual environment"
 }
 
 Log "Installing Python dependencies..."
 # Upgrading pip via python -m pip (not pip.exe directly) -- pip.exe can't
 # overwrite its own running executable on Windows.
-& "venv\Scripts\python.exe" -m pip install -q --disable-pip-version-check --upgrade pip
-& "venv\Scripts\python.exe" -m pip install -q --disable-pip-version-check -r requirements.txt
+& $venvPython -m pip install -q --disable-pip-version-check --upgrade pip
+Assert-LastExitCode "Upgrading pip"
+& $venvPython -m pip install -q --disable-pip-version-check -r requirements.txt
+Assert-LastExitCode "Installing requirements.txt"
 
 Log "Setup complete."
 Write-Host ""

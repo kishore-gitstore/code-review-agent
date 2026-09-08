@@ -27,6 +27,7 @@ from app.llm.factory import get_llm_client
 from app.gitlab.client import get_gitlab_client, UnknownGitLabInstance
 from app.agents.coordinator import CoordinatorAgent
 from app.reporting import ExecutionReport, list_reports, read_report
+from app.utils.console import force_utf8_streams
 from app.utils.models import MRContext
 from app.utils.diff_parser import get_changed_files, get_path_map, parse_diff
 
@@ -60,6 +61,9 @@ class ReviewProgress:
     critical_count: Optional[int] = None
     high_count:     Optional[int] = None
     error:          Optional[str] = None
+    # Finished, but part of it never ran (see ReviewResult.degraded) — so the
+    # counts above are a floor and this must not be badged as a plain success.
+    degraded:       bool = False
 
     @property
     def agents_pending(self) -> list:
@@ -86,6 +90,7 @@ class ReviewProgress:
             "critical_count": self.critical_count,
             "high_count":     self.high_count,
             "error":          self.error,
+            "degraded":       self.degraded,
         }
 
 
@@ -145,15 +150,18 @@ def _on_agent_done(instance: str, project_id: str | int, mr_iid: int, agent: str
                  remaining=p.agents_pending)
 
 
-def _finish(instance: str, project_id: str | int, mr_iid: int, total: int, critical: int, high: int) -> None:
+def _finish(instance: str, project_id: str | int, mr_iid: int, total: int, critical: int,
+            high: int, degraded: bool = False) -> None:
     if p := _reviews.get(_rkey(instance, project_id, mr_iid)):
         p.status = "done"
         p.finished_at = _now()
         p.total_issues = total
         p.critical_count = critical
         p.high_count = high
+        p.degraded = degraded
         p.agents_running = []
-        log.info("review.done", instance=instance, mr=mr_iid, total=total, critical=critical, high=high)
+        log.info("review.done", instance=instance, mr=mr_iid, total=total, critical=critical,
+                 high=high, degraded=degraded)
     _trim()
 
 
@@ -206,6 +214,10 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    # Also done in main.py, but repeated here so the ASGI entry points
+    # (`uvicorn main:app` in the Dockerfile, `--factory`) can't miss it.
+    force_utf8_streams()
+
     app = FastAPI(
         title="Code Review Agent",
         description="Multi-MR concurrent code review agent",
@@ -226,7 +238,13 @@ def create_app() -> FastAPI:
         """List all running and recently completed reviews."""
         return [p.as_dict() for p in _reviews.values()]
 
-    @app.get("/review/status/{instance}/{project_id}/{mr_iid}")
+    # {project_id:path} because GitLab projects are addressed by path
+    # ("group/repo"). The dashboard percent-encodes the slash, but ASGI hands
+    # Starlette the DECODED path, so a plain {project_id} sees one segment too
+    # many and misses this route — a 404 the live drawer reported as "this
+    # review is no longer active". :path soaks up the slashes and still leaves
+    # the trailing {mr_iid} segment to match.
+    @app.get("/review/status/{instance}/{project_id:path}/{mr_iid}")
     async def get_review_status(instance: str, project_id: str, mr_iid: int):
         """Get live progress for a specific MR review."""
         key = _rkey(instance, project_id, mr_iid)
@@ -234,7 +252,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="No review found for this MR")
         return _reviews[key].as_dict()
 
-    @app.post("/review/{instance}/{project_id}/{mr_iid}/clear-stale-note")
+    @app.post("/review/{instance}/{project_id:path}/{mr_iid}/clear-stale-note")
     async def clear_stale_note(instance: str, project_id: str, mr_iid: int):
         """
         Force-delete a dangling "review in progress" note right now, without
@@ -482,7 +500,7 @@ async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_titl
         report = ExecutionReport(
             repository=project_name, branch=source_branch, instance=instance,
             project_id=project_id, project_name=project_name, mr_iid=mr_iid, mr_title=mr_title,
-            mr_author=mr_author,
+            mr_author=mr_author, mr_url=mr_details.get("web_url", "") or "",
         )
         report.files_changed = len(changed_files)
         report.lines_added   = sum(fd.added_lines for fd in file_diffs)
@@ -557,16 +575,17 @@ async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_titl
                 progress_note_id = None
 
             await gitlab.post_review(result, mr_details, get_path_map(diff))
-            _finish(instance, project_id, mr_iid, result.total_issues, result.critical_count, result.high_count)
+            _finish(instance, project_id, mr_iid, result.total_issues, result.critical_count,
+                    result.high_count, degraded=result.degraded)
         except Exception as exc:
             report.status = "failed"
             report.error = str(exc)
             raise
         finally:
             report.finished_at = datetime.now()
-            report.print_console()
-            report.log_summary()
-            report.save_json()
+            # Saves before it renders, and won't let a rendering failure cost
+            # us the report the dashboard reads — see ExecutionReport.
+            report.persist_and_render()
 
             # Also cleaned up on the failure path (coordinator/post_review raised)
             # so a botched review doesn't leave the placeholder note dangling.

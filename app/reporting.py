@@ -86,6 +86,7 @@ class ExecutionReport:
         mr_iid: int | None = None,
         mr_title: str = "",
         mr_author: str = "",
+        mr_url: str = "",
     ):
         self.repository = repository
         self.branch = branch
@@ -95,6 +96,7 @@ class ExecutionReport:
         self.mr_iid = mr_iid
         self.mr_title = mr_title
         self.mr_author = mr_author
+        self.mr_url = mr_url
         self.model = get_active_model_label()
         self.execution_mode = get_execution_policy().mode
 
@@ -108,8 +110,8 @@ class ExecutionReport:
 
         self.started_at:  datetime | None = None
         self.finished_at: datetime | None = None
-        self.status = "running"  # running | success | failed | cancelled
-        self.error: str | None = None
+        self.status = "running"  # see the status property below
+        self.error = None
         self.result = None  # ReviewResult, once available
 
     # ── callbacks wired into CoordinatorAgent.run() ──────────────────────────
@@ -143,6 +145,46 @@ class ExecutionReport:
     def llm_durations(self) -> list[float]:
         return [r["duration_s"] for r in self.llm_requests]
 
+    @property
+    def llm_requests_failed(self) -> int:
+        return sum(1 for r in self.llm_requests if r["status"] == "Failed")
+
+    @property
+    def status(self) -> str:
+        """
+        running | success | partial | failed | cancelled.
+
+        "partial" is derived, never assigned: the review ran to completion (so
+        the caller sets "success") but at least one LLM request inside it
+        failed. Those failures are swallowed per-agent by design — a broken
+        agent returns no findings instead of sinking the review — so a review
+        against a dead LLM used to be reported as a clean "success" with zero
+        issues. Deriving it here makes every surface that reads .status (the
+        console footer, the structlog line, the JSON the dashboard reads,
+        review_local.py's exit code) degrade together, with no call site able
+        to forget.
+        """
+        if self._status == "success" and self.llm_requests_failed:
+            return "partial"
+        return self._status
+
+    @status.setter
+    def status(self, value: str) -> None:
+        self._status = value
+
+    @property
+    def error(self) -> str | None:
+        """The explicit error if one was set, else a synthesized one for
+        "partial" — nothing raised on that path, so no caller sets .error."""
+        if self._error is None and self.status == "partial":
+            return (f"{self.llm_requests_failed} of {len(self.llm_requests)} "
+                    f"LLM request(s) failed — findings are incomplete")
+        return self._error
+
+    @error.setter
+    def error(self, value: str | None) -> None:
+        self._error = value
+
     def summary_dict(self) -> dict:
         durations = self.llm_durations
         result = self.result
@@ -155,6 +197,7 @@ class ExecutionReport:
             "mr_iid": self.mr_iid,
             "mr_title": self.mr_title,
             "mr_author": self.mr_author,
+            "mr_url": self.mr_url,
             "model": self.model,
             "execution_mode": self.execution_mode,
             "status": self.status,
@@ -168,7 +211,7 @@ class ExecutionReport:
             "lines_removed": self.lines_removed,
             "static_analyzers_run": len(self.analyzers),
             "llm_requests_total": len(self.llm_requests),
-            "llm_requests_failed": sum(1 for r in self.llm_requests if r["status"] == "Failed"),
+            "llm_requests_failed": self.llm_requests_failed,
             "llm_avg_s":     sum(durations) / len(durations) if durations else 0.0,
             "llm_fastest_s": min(durations) if durations else 0.0,
             "llm_slowest_s": max(durations) if durations else 0.0,
@@ -178,12 +221,37 @@ class ExecutionReport:
             "medium_count":    result.medium_count if result else 0,
             "low_count":       result.low_count if result else 0,
             "ai_suggestions":  sum(1 for c in (result.comments if result else []) if c.suggestion),
+            "ai_fixes":        result.fix_count if result else 0,
+            "summary":         result.summary if result else "",
+            "static_analysis_notes": list(result.static_analysis_notes) if result else [],
+            "agent_stats":     self.agent_stats(),
+            "findings_by_agent": _count_by(result.comments if result else [], lambda c: c.agent),
+            "findings_by_file":  _count_by(result.comments if result else [], lambda c: c.file_path),
+            # The findings themselves (title/description/suggestion/fix), so the
+            # dashboard can show what was actually reported — not just counts.
+            "comments": [c.model_dump(mode="json") for c in (result.comments if result else [])],
             "llm_requests": [
                 {**r, "start": r["start"].isoformat(), "end": r["end"].isoformat()}
                 for r in self.llm_requests
             ],
             "static_analysis": self.analyzers,
         }
+
+    def agent_stats(self) -> dict[str, dict]:
+        """
+        Per-agent LLM roll-up: request count, failures, total seconds. Small
+        enough to ship in the slim report list (see list_reports) so the
+        dashboard can chart agent latency/failure rate across many reviews
+        without downloading every per-request table.
+        """
+        stats: dict[str, dict] = {}
+        for r in self.llm_requests:
+            agg = stats.setdefault(r["agent"], {"requests": 0, "failed": 0, "total_s": 0.0})
+            agg["requests"] += 1
+            agg["total_s"]  += r["duration_s"]
+            if r["status"] == "Failed":
+                agg["failed"] += 1
+        return stats
 
     # ── rendering ─────────────────────────────────────────────────────────
 
@@ -247,6 +315,7 @@ class ExecutionReport:
                 print(_c(text, color) if count > 0 else text)
             ai_suggestions = sum(1 for c in result.comments if c.suggestion)
             print(f"AI Suggestions       : {ai_suggestions}")
+            print(f"AI Fixes (applicable): {result.fix_count}")
         print()
 
         print(rule)
@@ -259,7 +328,7 @@ class ExecutionReport:
             print(f"\nAverage LLM Time     : {sum(durations) / len(durations):.2f}s")
             print(f"Fastest Request      : {min(durations):.2f}s")
             print(f"Slowest Request      : {max(durations):.2f}s")
-        failed = sum(1 for r in self.llm_requests if r["status"] == "Failed")
+        failed = self.llm_requests_failed
         print(f"Total LLM Requests   : {len(self.llm_requests)}")
         print(f"Successful Requests  : {len(self.llm_requests) - failed}")
         print(f"Failed Requests      : {failed}")
@@ -273,6 +342,9 @@ class ExecutionReport:
         print("\n" + rule)
         if self.status == "success":
             print(_c(f"Review completed successfully in {_fmt_duration(self.total_duration_s)}", "green"))
+        elif self.status == "partial":
+            print(_c(f"Review INCOMPLETE after {_fmt_duration(self.total_duration_s)}: "
+                     f"{self.error}", "yellow"))
         elif self.status == "cancelled":
             print(_c(f"Review cancelled after {_fmt_duration(self.total_duration_s)}", "yellow"))
         else:
@@ -325,27 +397,77 @@ class ExecutionReport:
         else:
             name = f"review_local_{stamp}.json"
         path = REPORTS_DIR / name
-        path.write_text(json.dumps(self.summary_dict(), indent=2))
+        # Explicit encoding, not the process locale: json.dumps escapes
+        # non-ASCII by default today, but the summary is full of emoji and
+        # nothing should make persisting a report depend on the code page.
+        path.write_text(json.dumps(self.summary_dict(), indent=2), encoding="utf-8")
         return path
 
     def log_summary(self) -> None:
         log.info("review.execution_summary", **self.summary_dict())
 
+    def persist_and_render(self) -> Path | None:
+        """
+        Write the report, then display it — in that order, and independently.
+
+        The dashboard has no source for a finished review other than this JSON,
+        and displaying it is the risky half: print_console/log_summary push the
+        summary's emoji verdict at stdout, which raised UnicodeEncodeError
+        under the Windows service (a cp1252 log file) and took the not-yet-run
+        save_json() down with it, so completed reviews left no trace at all.
+        force_utf8_streams() fixes that stdout; this ordering makes the record
+        independent of the table that describes it either way.
+
+        Returns the path written, or None if even that failed.
+        """
+        path = None
+        try:
+            path = self.save_json()
+        except Exception as exc:
+            log.error("report.save_failed", mr=self.mr_iid, error=str(exc))
+        try:
+            self.print_console()
+            self.log_summary()
+        except Exception as exc:
+            log.warning("report.render_failed", mr=self.mr_iid, error=str(exc))
+        return path
+
 
 # ── dashboard read-side ────────────────────────────────────────────────────
 
-def list_reports(limit: int = 200) -> list[dict]:
+# Per-item arrays that can run to hundreds of entries per report. The list
+# view only needs the roll-ups (counts, agent_stats, phase_ms); the dashboard
+# fetches these via read_report() when a single report is opened.
+_HEAVY_FIELDS = ("llm_requests", "comments")
+
+
+def _count_by(comments, key) -> dict[str, int]:
+    """{key(comment): count} roll-up — shipped in the slim report list so the
+    dashboard can chart findings per agent and hotspot files across reviews
+    without downloading every report's full comments array."""
+    counts: dict[str, int] = {}
+    for c in comments:
+        k = key(c)
+        counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def list_reports(limit: int = 200, slim: bool = True) -> list[dict]:
     """Summary dicts for the most recently finished reviews, newest first —
-    backs the /api/reports endpoint the dashboard page polls."""
+    backs the /api/reports endpoint the dashboard page polls. With slim=True
+    (the default) the heavy per-request/per-finding arrays are dropped."""
     if not REPORTS_DIR.exists():
         return []
     files = sorted(REPORTS_DIR.glob("review_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     reports = []
     for f in files[:limit]:
         try:
-            data = json.loads(f.read_text())
+            data = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
+        if slim:
+            for key in _HEAVY_FIELDS:
+                data.pop(key, None)
         data["_file"] = f.name
         reports.append(data)
     return reports
@@ -366,4 +488,4 @@ def read_report(filename: str) -> dict:
         raise ValueError(f"invalid report filename: {filename!r}")
     if not path.is_file():
         raise FileNotFoundError(filename)
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))

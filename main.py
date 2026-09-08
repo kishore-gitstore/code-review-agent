@@ -7,6 +7,12 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Before anything prints: under the NSSM service (and any redirect) stdout is
+# a cp1252 log file, and the review summary's emoji verdict would raise
+# UnicodeEncodeError mid-print. See app/utils/console.py.
+from app.utils.console import force_utf8_streams
+force_utf8_streams()
+
 if sys.platform == "win32":
     # uvicorn --reload resets Windows back to SelectorEventLoop, which can't
     # spawn subprocesses (asyncio.create_subprocess_exec) — needed here for

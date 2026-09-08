@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     min_severity_to_comment: str = "low"
     post_inline_comments: bool = True
     post_summary_comment: bool = True
+    # Render a finding's code fix as a GitLab ```suggestion block, which gives
+    # the MR author a one-click "Apply suggestion" button that commits it.
+    # Off → the fix is shown as a plain read-only code block instead.
+    post_fix_suggestions: bool = True
     post_progress_comment: bool = True  # transient "review in progress" note, deleted once the review completes
 
     # Review agents
