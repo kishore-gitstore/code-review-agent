@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sign in — Code Review Agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* Same token names and values as dashboard.html, so the two pages can't
+     drift into looking like different products. */
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f3f0;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
+    --accent: #2a78d6; --accent-wash: rgba(42,120,214,0.10);
+    --critical: #d03b3b; --warning: #fab219;
+    --shadow: 0 1px 2px rgba(0,0,0,.05), 0 6px 20px rgba(0,0,0,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222221;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+      --accent: #3987e5; --accent-wash: rgba(57,135,229,0.16);
+      --shadow: none;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222221;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+    --accent: #3987e5; --accent-wash: rgba(57,135,229,0.16);
+    --shadow: none;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--page); color: var(--ink); }
+  body {
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 24px 16px;
+  }
+  .card {
+    width: 100%; max-width: 380px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; box-shadow: var(--shadow); padding: 26px 24px 22px;
+  }
+  h1 { font-size: 18px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  .sub { margin: 4px 0 20px; color: var(--ink-2); font-size: 13px; }
+  label { display: block; font-size: 12px; color: var(--ink-2); margin: 0 0 5px; }
+  .field { margin-bottom: 14px; }
+  input {
+    font: inherit; color: var(--ink); background: var(--page); width: 100%;
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
+  }
+  input:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+  button {
+    font: inherit; font-weight: 600; width: 100%; cursor: pointer; color: #fff;
+    background: var(--accent); border: 0; border-radius: 8px; padding: 10px 12px;
+  }
+  button:hover:not(:disabled) { filter: brightness(1.07); }
+  button:disabled { opacity: .6; cursor: default; }
+  .msg {
+    font-size: 13px; border-radius: 8px; padding: 9px 11px; margin-bottom: 14px;
+    border: 1px solid var(--border); background: var(--surface-2);
+  }
+  .msg.error { border-left: 3px solid var(--critical); }
+  .msg.warn  { border-left: 3px solid var(--warning); }
+  .foot { margin: 16px 0 0; font-size: 12px; color: var(--muted); text-align: center; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<form class="card" id="form" autocomplete="on">
+  <h1>Code Review Agent</h1>
+  <p class="sub">Sign in with your Active Directory account to view review reports.</p>
+
+  <div class="msg error" id="msg" hidden role="alert"></div>
+
+  <div class="field">
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username" autocapitalize="none"
+           spellcheck="false" autofocus required placeholder="domain username">
+  </div>
+  <div class="field">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+  </div>
+
+  <button type="submit" id="submit">Sign in</button>
+  <p class="foot" id="foot"></p>
+</form>
+
+<script>
+const $ = s => document.querySelector(s);
+const msg = $("#msg"), submit = $("#submit");
+
+/* ?next= is echoed straight back into a same-origin fetch below, never into
+   an href — and the server sanitizes it again before trusting it. */
+const nextUrl = new URLSearchParams(location.search).get("next") || "/";
+const safeNext = (nextUrl.startsWith("/") && !nextUrl.startsWith("//") && !nextUrl.includes("\\")) ? nextUrl : "/";
+
+function show(text, kind) {
+  msg.textContent = text;
+  msg.className = "msg " + (kind || "error");
+  msg.hidden = false;
+}
+
+/* Surfaces why the previous page bounced here, instead of a bare login form
+   appearing for no visible reason. */
+const reason = new URLSearchParams(location.search).get("reason");
+if (reason === "expired")    show("Your session expired. Sign in again to continue.", "warn");
+else if (reason === "denied") show("You do not have access to this dashboard.", "error");
+
+$("#form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  msg.hidden = true;
+  submit.disabled = true;
+  submit.textContent = "Signing in…";
+  try {
+    const res = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: $("#username").value, password: $("#password").value }),
+    });
+    if (res.ok) { location.replace(safeNext); return; }
+    let detail = `Sign-in failed (${res.status}).`;
+    try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (e) {}
+    show(detail, res.status >= 500 ? "warn" : "error");
+    $("#password").value = "";
+    $("#password").focus();
+  } catch (e) {
+    show("Could not reach the server. Check your connection and try again.", "warn");
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "Sign in";
+  }
+});
+
+/* Tell the user which domain they're signing in to, when the server knows. */
+fetch("/api/auth/info").then(r => r.ok ? r.json() : null).then(info => {
+  if (!info) return;
+  if (!info.auth_enabled) { location.replace(safeNext); return; }
+  if (info.domain) {
+    $("#foot").textContent = "Domain: " + info.domain;
+    $("#username").placeholder = "your " + info.domain + " username";
+  }
+}).catch(() => {});
+</script>
+</body>
+</html>

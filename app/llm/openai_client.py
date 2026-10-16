@@ -4,9 +4,10 @@ Works with GPT-4o, GPT-4.1, o3-mini, o1, etc.
 """
 
 from __future__ import annotations
+import asyncio
 import httpx
 import structlog
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from app.llm.base_client import BaseLLMClient
 from app.settings import get_settings
@@ -29,7 +30,14 @@ class OpenAIClient(BaseLLMClient):
             "Content-Type":  "application/json",
         }
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
+    # retry_if_not_exception_type(CancelledError): tenacity catches
+    # BaseException, so without this a review cancelled mid-request would
+    # have its LLM call retried instead of stopping.
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=2, max=10),
+        retry=retry_if_not_exception_type(asyncio.CancelledError),
+    )
     async def generate(self, system_prompt: str, user_prompt: str) -> str:
         payload = {
             "model":       self.model,

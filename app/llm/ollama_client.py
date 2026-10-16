@@ -52,7 +52,10 @@ class OllamaClient(BaseLLMClient):
     @retry(
         stop=stop_after_attempt(2),
         wait=wait_exponential(min=2, max=10),
-        retry=retry_if_not_exception_type(OllamaTimeoutError),
+        # asyncio.CancelledError joins it here for a different reason:
+        # tenacity catches BaseException, so a review cancelled mid-request
+        # would otherwise have its LLM call retried instead of stopping.
+        retry=retry_if_not_exception_type((OllamaTimeoutError, asyncio.CancelledError)),
     )
     async def generate(self, system_prompt: str, user_prompt: str) -> str:
         payload = {

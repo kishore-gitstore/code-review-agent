@@ -157,9 +157,11 @@ def test_force_utf8_streams_is_safe_on_a_stream_it_cannot_reconfigure():
 # ── 2. the live-status route reaches path-style project ids ─────────────────
 
 @pytest.fixture
-def client():
+def client(signed_in_client):
+    """Signed in, because these endpoints now require an AD session — see
+    tests/conftest.py. The gate itself is covered in test_auth.py."""
     with patch.dict(server._reviews, {}, clear=True):
-        yield TestClient(server.create_app())
+        yield signed_in_client
 
 
 def _register(instance, project_id, mr_iid):

@@ -10,6 +10,7 @@ import os
 import re
 import structlog
 import httpx
+from datetime import datetime
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from app.settings import get_settings
@@ -29,6 +30,12 @@ class UnknownGitLabInstance(Exception):
 # post_progress_note/delete_stale_progress_notes) — a shared constant so the
 # text posted and the text matched during cleanup can't drift apart.
 PROGRESS_NOTE_MARKER = "🔄 **Automated code review in progress…**"
+
+# Marker prefix for the permanent "review cancelled" note. Deliberately NOT a
+# string starting with PROGRESS_NOTE_MARKER: delete_stale_progress_notes()
+# matches on that prefix, and a cancellation record the next run silently
+# deleted would defeat the point of leaving an audit trail on the MR.
+CANCELLED_NOTE_MARKER = "🛑 **Automated code review cancelled**"
 
 _EMOJI = {
     Severity.critical: "🔴",
@@ -192,9 +199,23 @@ class GitLabClient:
         return note_id
 
     async def delete_mr_note(self, project_id: str | int, mr_iid: int, note_id: int) -> None:
-        """Delete a previously posted MR note (e.g. a "review in progress" placeholder
-        once the real results are ready to post)."""
-        url = f"{self.base_url}/projects/{_enc(project_id)}/merge_requests/{mr_iid}/notes/{note_id}"
+        """Delete ONE previously posted MR note (e.g. a "review in progress"
+        placeholder once the real results are ready to post).
+
+        This is the only DELETE the agent ever sends to GitLab, and it must
+        never be able to reach the merge request itself: a URL that lost its
+        /notes/{id} tail would be GitLab's "delete this MR" endpoint. So both
+        ids must be real positive integers, and the URL is checked to still
+        be a note URL, before anything is sent.
+        """
+        if not _is_positive_int(mr_iid) or not _is_positive_int(note_id):
+            raise ValueError(
+                f"refusing to delete: mr_iid={mr_iid!r} and note_id={note_id!r} "
+                "must both be positive integers"
+            )
+        url = f"{self.base_url}/projects/{_enc(project_id)}/merge_requests/{int(mr_iid)}/notes/{int(note_id)}"
+        if not re.search(r"/merge_requests/\d+/notes/\d+$", url):
+            raise ValueError(f"refusing to delete: {url} is not a note URL")
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.delete(url, headers=self.headers)
             r.raise_for_status()
@@ -208,6 +229,54 @@ class GitLabClient:
             project_id, mr_iid,
             f"{PROGRESS_NOTE_MARKER}\n\nThis comment will be replaced once the review completes.",
         )
+
+    async def post_cancelled_note(
+        self,
+        project_id:   str | int,
+        mr_iid:       int,
+        cancelled_by: str = "",
+        agents_done:  int | None = None,
+        agents_total: int | None = None,
+        duration_s:   float | None = None,
+    ) -> int | None:
+        """
+        Post the permanent record that a review was stopped mid-flight.
+
+        This replaces the transient progress note rather than editing it, so
+        the MR keeps a dated entry in its discussion history that a later run
+        won't clean up. The wording leads with "no findings were posted"
+        because the dangerous reading of a silent review is "the bot looked
+        and found nothing" — a cancelled review is an absence of evidence,
+        not evidence of absence.
+        """
+        rows = []
+        if cancelled_by:
+            rows.append(("Cancelled by", cancelled_by))
+        rows.append(("Cancelled at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        if duration_s is not None:
+            rows.append(("Ran for", f"{int(duration_s // 60)}m {int(duration_s % 60):02d}s"))
+        if agents_total:
+            rows.append(("Agents completed", f"{agents_done or 0} of {agents_total}"))
+
+        table = "\n".join(f"| {label} | {value} |" for label, value in rows)
+        body = (
+            f"{CANCELLED_NOTE_MARKER}\n\n"
+            "This merge request's automated review was stopped before it finished, so "
+            "**no findings were posted**. Treat this MR as *not reviewed* — not as approved.\n\n"
+            "| | |\n|---|---|\n"
+            f"{table}\n\n"
+            "Push a new commit to this branch, or re-trigger the review, to run it again."
+        )
+        return await self.post_mr_note(project_id, mr_iid, body)
+
+    async def _own_username(self) -> str:
+        """Username the configured token authenticates as (cached)."""
+        if getattr(self, "_own_name", None) is None:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.get(f"{self.base_url}/user", headers=self.headers)
+                r.raise_for_status()
+            self._own_name = str(r.json().get("username", ""))
+        return self._own_name
 
     async def list_mr_notes(self, project_id: str | int, mr_iid: int) -> list[dict]:
         url = f"{self.base_url}/projects/{_enc(project_id)}/merge_requests/{mr_iid}/notes"
@@ -230,7 +299,29 @@ class GitLabClient:
             log.warning("gitlab.stale_progress_notes.list_failed", mr=mr_iid, error=str(exc))
             return 0
 
-        stale = [n for n in notes if str(n.get("body", "")).startswith(PROGRESS_NOTE_MARKER)]
+        # Only our OWN, user-visible progress placeholders. A bare prefix match
+        # isn't enough: a person quoting the placeholder in a reply, or a
+        # system note, would be swept up with it. Fail closed — if we can't
+        # establish who the token belongs to, delete nothing.
+        candidates = [
+            n for n in notes
+            if str(n.get("body", "")).startswith(PROGRESS_NOTE_MARKER) and not n.get("system")
+        ]
+        stale = []
+        own = None
+        if any((n.get("author") or {}).get("username") for n in candidates):
+            try:
+                own = await self._own_username()
+            except Exception as exc:
+                log.warning("gitlab.stale_progress_notes.identity_failed", mr=mr_iid, error=str(exc))
+                return 0
+        for n in candidates:
+            author = (n.get("author") or {}).get("username")
+            if author and author != own:
+                log.info("gitlab.stale_progress_notes.skipped_foreign", mr=mr_iid,
+                         note_id=n.get("id"), author=author)
+                continue
+            stale.append(n)
         deleted = 0
         for note in stale:
             try:
@@ -333,6 +424,10 @@ class GitLabClient:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _is_positive_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
 
 def _enc(project_id: str | int) -> str:
     """URL-encode the project path (e.g. 'group/repo' → 'group%2Frepo')."""

@@ -4,9 +4,10 @@ Requires: pip install anthropic  (already in requirements.txt)
 """
 
 from __future__ import annotations
+import asyncio
 import httpx
 import structlog
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from app.llm.base_client import BaseLLMClient
 from app.settings import get_settings
@@ -30,7 +31,14 @@ class ClaudeClient(BaseLLMClient):
             "content-type":      "application/json",
         }
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
+    # retry_if_not_exception_type(CancelledError): tenacity catches
+    # BaseException, so without this a review cancelled mid-request would
+    # have its LLM call retried instead of stopping.
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=2, max=10),
+        retry=retry_if_not_exception_type(asyncio.CancelledError),
+    )
     async def generate(self, system_prompt: str, user_prompt: str) -> str:
         payload = {
             "model":      self.model,

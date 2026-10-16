@@ -10,3 +10,7 @@ pytest==8.3.2
 pytest-asyncio==0.23.8
 anthropic==0.40.0
 openai==1.54.0
+# Dashboard login: LDAP bind against Active Directory, and the signed
+# session cookie it issues.
+ldap3==2.9.1
+itsdangerous==2.2.0

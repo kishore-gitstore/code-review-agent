@@ -32,7 +32,7 @@ fi
 # Export .env into the shell so APP_HOST/APP_PORT (read via os.getenv in
 # main.py) match what's configured there, not just main.py's fallback defaults.
 set -a
-source .env
+source <(tr -d '\r' < .env)  # tolerate CRLF line endings
 set +a
 
 # Interactive/dev usage — live-reload on file changes.

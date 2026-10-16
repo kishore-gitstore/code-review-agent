@@ -79,7 +79,20 @@
   .toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
   .toggle input { margin: 0; }
   .theme-btn { padding: 3px 9px; font-size: 14px; line-height: 1.2; }
+  button:disabled { opacity: .55; cursor: default; }
+  .user-pill { font-weight: 600; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+  .user-pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--good); display: inline-block; }
+  .link-btn { border: 0; background: transparent; color: var(--ink-2); padding: 3px 6px; font-size: 13px; }
+  .link-btn:hover { background: transparent; color: var(--ink); text-decoration: underline; }
+  /* Destructive, and never the default action — outlined rather than filled,
+     so Cancel can't be hit by muscle memory aimed at a primary button. */
+  .btn-danger { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); }
+  .btn-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--critical) 12%, transparent); }
+  .cancel-btn { padding: 1px 9px; font-size: 11px; font-weight: 600; border-radius: 999px; }
+  .d-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
+  .nav { display: flex; gap: 14px; margin-top: 6px; font-size: 13px; }
+  .nav a[aria-current] { color: var(--ink); font-weight: 600; }
   .filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
   .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
   .seg button { border: 0; border-radius: 0; padding: 6px 12px; background: transparent; color: var(--ink-2); }
@@ -237,11 +250,14 @@
   <div>
     <h1>Code Review Agent</h1>
     <p class="sub" id="sub">Loading…</p>
+    <nav class="nav"><a href="/">Home</a> <a href="/dashboard" aria-current="page">Reports</a> <a href="/config" id="nav-config" hidden>Configuration</a></nav>
   </div>
   <div class="top-right">
     <span class="pill" id="live-pill" hidden><span class="dot pulse"></span><span id="live-count"></span></span>
     <span class="muted" id="refreshed"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
+    <span class="pill user-pill" id="user-pill" hidden><i></i><span id="user-name"></span></span>
+    <button class="link-btn" id="signout-btn" hidden>Sign out</button>
     <button class="theme-btn" id="theme-btn" aria-label="Toggle theme">◐</button>
   </div>
 </header>
@@ -360,12 +376,54 @@ const STATUS = {
   error:     { label: "failed",    color: "var(--critical)" },
   cancelled: { label: "cancelled", color: "var(--warning)" },
   running:   { label: "running",   color: "var(--accent)" },
+  // Requested, but the task hasn't unwound yet — a real state the user needs
+  // to see, or a slow cancel looks like a click that did nothing.
+  cancelling: { label: "cancelling…", color: "var(--warning)" },
 };
 const statusBadge = s => { const m = STATUS[s] || { label: s || "–", color: "var(--muted)" }; return `<span class="badge"><i style="background:${m.color}"></i>${esc(m.label)}</span>`; };
 const sevChips = r => {
   const parts = SEV.filter(s => r[s.key + "_count"]).map(s => `<span class="sev ${s.key}" title="${s.label}">${r[s.key + "_count"]}${s.label[0]}</span>`);
   return parts.length ? `<span class="sevs">${parts.join("")}</span>` : `<span class="muted">0</span>`;
 };
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   session — every gated call goes through api()
+   ═══════════════════════════════════════════════════════════════════════════ */
+let leavingForLogin = false;
+
+/* A 401 here means the AD session expired while the tab sat open. Bounce to
+   the login form carrying ?next=, rather than letting the page quietly render
+   an empty dashboard that looks like "no reviews yet". Guarded so a burst of
+   parallel calls can't fire several navigations. */
+async function api(url, opts) {
+  const res = await fetch(url, Object.assign({ credentials: "same-origin" }, opts || {}));
+  if (res.status === 401 && !leavingForLogin) {
+    leavingForLogin = true;
+    const back = encodeURIComponent(location.pathname + location.search + location.hash);
+    location.replace(`/login?reason=expired&next=${back}`);
+  }
+  return res;
+}
+
+async function loadUser() {
+  let info;
+  try { const res = await api("/api/me"); if (!res.ok) return; info = await res.json(); }
+  catch (e) { return; }
+  if (info && info.is_admin) $("#nav-config").hidden = false;
+  // AUTH_ENABLED=false: there is no real identity to show, so show nothing
+  // rather than a chip reading "Anonymous" that implies a login happened.
+  if (!info || !info.auth_enabled || !info.user) return;
+  $("#user-name").textContent = info.user.display_name || info.user.username;
+  $("#user-pill").title = info.user.email || info.user.username;
+  $("#user-pill").hidden = false;
+  $("#signout-btn").hidden = false;
+}
+
+$("#signout-btn").addEventListener("click", async () => {
+  try { await fetch("/api/logout", { method: "POST", credentials: "same-origin" }); } catch (e) {}
+  leavingForLogin = true;
+  location.replace("/login");
+});
 
 /* ═══════════════════════════════════════════════════════════════════════════
    state + data
@@ -750,10 +808,17 @@ function renderTable({ cur }) {
       <td>!${esc(l.mr_iid)}</td>
       <td>${esc(l.mr_author || "–")}</td>
       <td>${esc(l.branch || "–")}</td>
-      <td>${statusBadge("running")} <span class="muted">${l.agents_done.length}/${l.agents_total} agents</span></td>
+      <td>${statusBadge(l.cancel_requested ? "cancelling" : "running")} <span class="muted">${l.agents_done.length}/${l.agents_total} agents</span></td>
       <td>${esc(fmtTime(l.started_at))}</td>
       <td class="num">${fmtDur((Date.now() - Date.parse(l.started_at)) / 1000)}</td>
-      <td><span class="muted">…</span></td><td class="num muted">–</td><td class="num muted">–</td><td class="muted">–</td>`;
+      <td><span class="muted">…</span></td><td class="num muted">–</td><td class="num muted">–</td>
+      <td>${l.cancel_requested
+            ? `<span class="muted">cancelling…</span>`
+            : `<button class="cancel-btn btn-danger" type="button" data-cancel>Cancel</button>`}</td>`;
+    // stopPropagation: the row itself opens the live drawer, and one click
+    // that both cancels a review and opens a panel about it is two actions.
+    const cancelBtn = tr.querySelector("[data-cancel]");
+    if (cancelBtn) cancelBtn.addEventListener("click", ev => { ev.stopPropagation(); cancelReview(l, cancelBtn); });
     tr.addEventListener("click", () => openLive(l));
     rows.appendChild(tr);
   }
@@ -785,6 +850,43 @@ function renderTable({ cur }) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   cancelling a running review
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* project_id is a path ("group/sub/repo"), so it goes in as one encoded
+   component — the route declares it :path and reassembles it. */
+const cancelUrl = l =>
+  `/review/${encodeURIComponent(l.instance)}/${encodeURIComponent(l.project_id)}/${l.mr_iid}/cancel`;
+
+/* Confirmed, not one-click: this throws away minutes of LLM work and writes a
+   permanent note onto someone's merge request. The wording says both. */
+async function cancelReview(l, btn) {
+  const who = `${l.project_name || l.project_id} !${l.mr_iid}`;
+  if (!confirm(`Cancel the review of ${who}?\n\nNo findings will be posted, and the merge `
+             + `request will be updated to record that the review was cancelled.`)) return;
+
+  const restore = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "Cancelling…"; }
+  try {
+    const res = await api(cancelUrl(l), { method: "POST" });
+    if (!res.ok) {
+      let detail = `Could not cancel this review (${res.status}).`;
+      try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (e) {}
+      alert(detail);
+      if (btn) { btn.disabled = false; btn.textContent = restore; }
+      return;
+    }
+    // The server flags cancel_requested immediately, but the task unwinds
+    // asynchronously — reflect that locally and let the next poll confirm.
+    l.cancel_requested = true;
+    refresh();
+  } catch (e) {
+    alert("Could not reach the server to cancel this review.");
+    if (btn) { btn.disabled = false; btn.textContent = restore; }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    detail drawer
    ═══════════════════════════════════════════════════════════════════════════ */
 const drawer = $("#drawer"), scrim = $("#scrim");
@@ -801,7 +903,7 @@ async function openDetail(file) {
   history.replaceState(null, "", `#report=${encodeURIComponent(file)}`);  // deep link to this report
   showDrawer(file, "");
   let d;
-  try { const res = await fetch(`/api/reports/${encodeURIComponent(file)}`); if (!res.ok) throw new Error(res.status); d = await res.json(); }
+  try { const res = await api(`/api/reports/${encodeURIComponent(file)}`); if (!res.ok) throw new Error(res.status); d = await res.json(); }
   catch (e) { $("#d-body").innerHTML = `<div class="muted">Could not load this report (${esc(e.message || e)}).</div>`; return; }
   if (!state.detail || state.detail.file !== file) return;
   renderDetail(d);
@@ -901,10 +1003,13 @@ async function openLive(l) {
 async function refreshLive() {
   const lv = state.detail && state.detail.live; if (!lv) return;
   let d;
-  try { const res = await fetch(`/review/status/${encodeURIComponent(lv.instance)}/${encodeURIComponent(lv.project_id)}/${lv.mr_iid}`); if (!res.ok) throw new Error(res.status); d = await res.json(); }
+  try { const res = await api(`/review/status/${encodeURIComponent(lv.instance)}/${encodeURIComponent(lv.project_id)}/${lv.mr_iid}`); if (!res.ok) throw new Error(res.status); d = await res.json(); }
   catch (e) { $("#d-body").innerHTML = `<div class="muted">This review is no longer active.</div>`; return; }
   const row = (name, label) => `<div class="row"><span class="agent-tag"><i style="background:${agentMeta(name).color}"></i>${esc(agentMeta(name).label)}</span>${label}</div>`;
-  $("#d-meta").innerHTML = [statusBadge(d.status === "running" ? "running" : d.status === "done" ? (d.degraded ? "partial" : "success") : "failed"), d.mr_author ? `by ${esc(d.mr_author)}` : "", d.branch ? `<code>${esc(d.branch)}</code>` : "", `started ${esc(fmtTime(d.started_at))}`].filter(Boolean).join(" · ");
+  const liveBadge = d.status === "running" ? (d.cancel_requested ? "cancelling" : "running")
+                  : d.status === "cancelled" ? "cancelled"
+                  : d.status === "done" ? (d.degraded ? "partial" : "success") : "failed";
+  $("#d-meta").innerHTML = [statusBadge(liveBadge), d.mr_author ? `by ${esc(d.mr_author)}` : "", d.branch ? `<code>${esc(d.branch)}</code>` : "", `started ${esc(fmtTime(d.started_at))}`].filter(Boolean).join(" · ");
   $("#d-body").innerHTML = `
     <div class="section"><h3>Agents — ${d.agents_done.length}/${d.agents_total} complete</h3>
       <div class="agents-live">
@@ -912,7 +1017,15 @@ async function refreshLive() {
         ${d.agents_running.map(a => row(a, statusBadge("running"))).join("")}
         ${d.agents_pending.map(a => row(a, `<span class="muted">pending</span>`)).join("")}
       </div></div>
-    ${d.status !== "running" ? `<div class="verdict">Finished — ${d.total_issues ?? 0} issue(s), ${d.critical_count ?? 0} critical, ${d.high_count ?? 0} high. The full report will appear in the list shortly.</div>` : `<div class="muted" style="font-size:12px">Running for ${fmtDur((Date.now() - Date.parse(d.started_at)) / 1000)} — this panel refreshes automatically.</div>`}`;
+    ${d.status === "cancelled"
+      ? `<div class="verdict" style="border-left:3px solid var(--warning)"><strong>Review cancelled${d.cancelled_by ? " by " + esc(d.cancelled_by) : ""}.</strong> No findings were posted, so this merge request is <em>not reviewed</em> — it has not been approved. A note recording the cancellation was added to the MR.</div>`
+      : d.status !== "running"
+      ? `<div class="verdict">Finished — ${d.total_issues ?? 0} issue(s), ${d.critical_count ?? 0} critical, ${d.high_count ?? 0} high. The full report will appear in the list shortly.</div>`
+      : `<div class="muted" style="font-size:12px">Running for ${fmtDur((Date.now() - Date.parse(d.started_at)) / 1000)} — this panel refreshes automatically.</div>
+         <div class="d-actions"><button class="btn-danger" type="button" id="d-cancel" ${d.cancel_requested ? "disabled" : ""}>${d.cancel_requested ? "Cancelling…" : "Cancel this review"}</button></div>`}`;
+
+  const dCancel = $("#d-cancel");
+  if (dCancel) dCancel.addEventListener("click", () => cancelReview(d, dCancel));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -981,7 +1094,7 @@ applyTheme(theme);
 async function refresh() {
   const main = $("#main"); main.classList.add("loading");
   try {
-    const [repRes, actRes] = await Promise.all([fetch("/api/reports?limit=500"), fetch("/review/active")]);
+    const [repRes, actRes] = await Promise.all([api("/api/reports?limit=500"), api("/review/active")]);
     if (!repRes.ok) throw new Error(`reports ${repRes.status}`);
     state.reports = await repRes.json();
     const active = actRes.ok ? await actRes.json() : [];
@@ -1004,6 +1117,7 @@ setInterval(() => { if ($("#auto").checked) refresh(); }, 10000);
 
 buildChartCards();
 readFiltersFromUrl();
+loadUser();
 refresh().then(() => {
   const m = /^#report=(.+)$/.exec(location.hash);
   if (m) openDetail(decodeURIComponent(m[1]));

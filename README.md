@@ -194,7 +194,7 @@ machine:
 setup/
 ├── windows/   setup.ps1, run.ps1, install-service.ps1, uninstall-service.ps1
 ├── linux/     setup.sh, run.sh, install-service.sh, uninstall-service.sh, code-review-agent.service
-└── macos/     setup.sh, run.sh
+└── macos/     setup.sh, run.sh, install-service.sh, uninstall-service.sh
 ```
 
 Each `setup.*` checks for git/Python 3.12/Ollama, installs whichever are
@@ -363,6 +363,42 @@ untouched.
 
 ---
 
+## Run as a launchd Service (macOS)
+
+The macOS equivalent of the systemd unit — a launchd daemon that starts at
+boot (no login required) and is restarted automatically if it stops:
+
+```bash
+# 1. Run it once by hand first — creates the venv and confirms it starts.
+./setup/macos/run.sh
+# Ctrl+C once you see "Application startup complete."
+
+# 2. Install + start the service (generates the plist from this machine's
+#    user/paths and loads it into /Library/LaunchDaemons)
+sudo ./setup/macos/install-service.sh
+
+# 3. Check status / logs
+sudo launchctl print system/com.codereviewagent.service
+tail -f logs/service.out.log logs/service.err.log
+```
+
+The daemon runs `main.py` directly with `.env` exported (CRLF tolerated) and
+`UVICORN_RELOAD` unset, as the user who ran the script. `KeepAlive` restarts
+it 60 seconds after any exit (`ThrottleInterval`). To pick up a code or
+config change: `sudo launchctl kickstart -k system/com.codereviewagent.service`.
+Re-running the install script is safe.
+
+**Uninstall:**
+
+```bash
+sudo ./setup/macos/uninstall-service.sh
+```
+
+Stops the daemon and removes the plist — leaves the venv, `.env`, logs, and
+the rest of the repo untouched.
+
+---
+
 ## Run as a Windows Service
 
 For a persistent deployment that survives logout, crashes, and reboots,
@@ -457,6 +493,12 @@ Open `http://<host>:8000/dashboard` for a live view of everything the agent has
 reviewed. It is a single self-contained page (no CDN or external calls, so it
 works on an air-gapped server) fed by `/api/reports` and `/review/active`.
 
+**Sign-in is required** — see [Dashboard Login](#dashboard-login-active-directory)
+below. Reports quote real source lines out of private repositories, so the
+dashboard, the report APIs and the control endpoints all sit behind an Active
+Directory session. GitLab webhooks do not (they can't hold one; they keep
+authenticating with their own `webhook_secret`).
+
 - **Filters in one row** — date range (24h / 7d / 30d / 90d / all), GitLab
   instance, project, status and free-text search. Every figure, chart and table
   below re-computes against the same slice, and the filters live in the URL so
@@ -471,6 +513,14 @@ works on an air-gapped server) fed by `/api/reports` and `/review/active`.
   copy-paste, or when colour alone isn't enough.
 - **Reviews table** — sortable, with in-progress reviews pinned on top showing
   agent progress. MR numbers link straight to GitLab.
+- **Cancel a running review** — every in-progress row carries a **Cancel**
+  button (also in the live detail panel). It interrupts the pipeline
+  immediately, mid-LLM-call if need be, and then updates the merge request:
+  the transient *review in progress* note is replaced with a permanent
+  *review cancelled* record naming who cancelled it, how far it got, and
+  stating plainly that no findings were posted — so a stopped review can't
+  be mistaken for a clean one. The review is saved to `reports/` with status
+  `cancelled`.
 - **Review detail** — click a row for the verdict, where the time went
   (static analysis / LLM / merge), severity mix, and every finding with its
   description, suggestion and ready-to-apply fix. Filter findings by severity
@@ -482,6 +532,71 @@ works on an air-gapped server) fed by `/api/reports` and `/review/active`.
 Reports are the JSON files `app/reporting.py` writes under `reports/` after
 every review (webhook-triggered or local CLI), so the dashboard needs no
 database — delete a file and it disappears from the dashboard.
+
+---
+
+## Dashboard Login (Active Directory)
+
+The dashboard authenticates against your existing AD by **binding as the user**:
+the username and password typed into the login form are used to open an LDAP
+connection to a domain controller. If AD accepts them the password is correct,
+which means no service account is needed and no password is ever stored here.
+
+```ini
+AUTH_ENABLED=true
+LDAP_SERVER=ldaps://dc01.corp.local     # ldaps:// forces TLS whatever LDAP_USE_SSL says
+LDAP_DOMAIN=corp.local                  # turns "alice" into "alice@corp.local" for the bind
+LDAP_BASE_DN=DC=corp,DC=local           # optional: display name + group membership
+LDAP_REQUIRED_GROUP=CRA-Dashboard-Users # optional: restrict to one AD group
+SESSION_SECRET=<48 random bytes>        # python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+A successful login issues a signed, expiring cookie (`SESSION_TTL_HOURS`,
+default 8). There is no server-side session store, so restarting the service
+doesn't sign everybody out and two instances behind a load balancer need
+nothing shared but `SESSION_SECRET`. **Leave `SESSION_SECRET` empty and a
+random one is generated per process** — logins then die on every restart.
+
+Notes:
+
+- **Use `ldaps://`.** A plain LDAP bind sends the password in clear text.
+- **`SESSION_COOKIE_SECURE=true`** once the dashboard is served over HTTPS.
+- **Login name forms.** `alice`, `alice@corp.local` and `CORP\alice` all work.
+  A bare name is qualified using `LDAP_DOMAIN` (or `LDAP_NETBIOS_DOMAIN` when
+  `LDAP_BIND_STYLE=ntlm`); an already-qualified one is passed through untouched.
+- **`LDAP_REQUIRED_GROUP`** given as a bare CN matches direct membership; given
+  as a full DN it also matches nested groups (AD's `LDAP_MATCHING_RULE_IN_CHAIN`).
+  It needs `LDAP_BASE_DN` to be set.
+- **Scripts and CI** that trigger reviews without a browser can send
+  `X-API-Token: <DASHBOARD_API_TOKEN>` instead of signing in. Empty (the
+  default) disables that path entirely.
+- **`AUTH_ENABLED=false`** leaves the dashboard open to anyone who can reach
+  the port. Dev boxes only.
+
+What each caller may reach:
+
+| Endpoint | Who |
+|---|---|
+| `/dashboard`, `/api/reports*`, `/review/active`, `/review/status/...` | signed-in AD user |
+| `POST /review`, `POST /review/.../cancel`, `.../clear-stale-note` | signed-in AD user (or `X-API-Token`) |
+| `POST /webhook/gitlab/{instance}` | GitLab, via `webhook_secret` — **not** behind the login |
+| `GET /health` | open, so load balancers and NSSM can probe it |
+
+---
+
+## Cancelling a Review
+
+```bash
+curl -X POST http://localhost:8000/review/gitlab_com/myorg%2Fmyrepo/42/cancel \
+  -H "X-API-Token: $DASHBOARD_API_TOKEN"
+```
+
+Returns **202**, not 200 — cancellation is a request, not an instant. The task
+is interrupted at its next `await` (usually immediately; an in-flight LLM
+response still has to unwind), and only then is the merge request updated.
+`GET /review/status/...` flips `cancel_requested` to `true` straight away, and
+`status` to `cancelled` once it has landed. Cancelling a review that has
+already finished is refused with a **409** rather than reported as cancelled.
 
 ---
 
@@ -517,6 +632,22 @@ database — delete a file and it disappears from the dashboard.
 | `CLANG_TIDY_ARGS`         | `-- -std=c++17`              | Fallback compiler flags used only when no `compile_commands.json` is found under the checkout |
 | `SPOTBUGS_CMD`            | `spotbugs`                  | SpotBugs (Java) — binary name or full path |
 | `SPOTBUGS_CLASSES_DIRS`   | `target/classes,build/classes/java/main` | Comma-separated candidate build-output directories, checked in order; first one that exists is used |
+| `AUTH_ENABLED`            | `true`                      | Require an Active Directory login for the dashboard and report APIs — see [Dashboard Login](#dashboard-login-active-directory) |
+| `LDAP_SERVER`             | *(empty)*                   | Domain controller: bare host, `host:port`, or a URL. `ldaps://` forces TLS |
+| `LDAP_PORT`               | `0`                         | `0` → 636 with SSL, 389 without |
+| `LDAP_USE_SSL`            | `true`                      | Plain LDAP sends the password in clear text |
+| `LDAP_TIMEOUT`            | `10`                        | Seconds to wait on the directory |
+| `LDAP_BIND_STYLE`         | `upn`                       | `upn` (`name@LDAP_DOMAIN`) or `ntlm` (`NETBIOS\name`) |
+| `LDAP_DOMAIN`             | *(empty)*                   | AD domain, e.g. `corp.local` — required for `upn` |
+| `LDAP_NETBIOS_DOMAIN`     | *(empty)*                   | e.g. `CORP` — only for `ntlm`; defaults to the first label of `LDAP_DOMAIN` |
+| `LDAP_BASE_DN`            | *(empty)*                   | Search base for display name/groups. Optional; required by `LDAP_REQUIRED_GROUP` |
+| `LDAP_USER_FILTER`        | `(&(objectClass=user)(sAMAccountName={username}))` | User lookup filter |
+| `LDAP_REQUIRED_GROUP`     | *(empty)*                   | Restrict access to one AD group. Empty = any account that can bind |
+| `SESSION_SECRET`          | *(empty)*                   | Signs the session cookie. Empty → random per process, so logins die on restart |
+| `SESSION_TTL_HOURS`       | `8`                         | How long a login lasts |
+| `SESSION_COOKIE_NAME`     | `cra_session`               | Cookie name |
+| `SESSION_COOKIE_SECURE`   | `false`                     | Set `true` once the dashboard is served over HTTPS |
+| `DASHBOARD_API_TOKEN`     | *(empty)*                   | Optional `X-API-Token` for non-browser callers. Empty disables it |
 
 ---
 
@@ -589,13 +720,18 @@ code-review-agent/
 ├── setup/                          # Per-OS setup/run/service scripts (see "One-command setup" above)
 │   ├── windows/                    # setup.ps1, run.ps1, install-service.ps1 (NSSM), uninstall-service.ps1
 │   ├── linux/                      # setup.sh, run.sh, install-service.sh (systemd), uninstall-service.sh, code-review-agent.service
-│   └── macos/                      # setup.sh, run.sh
+│   └── macos/                      # setup.sh, run.sh, install-service.sh (launchd), uninstall-service.sh
 ├── app/
 │   ├── settings.py                # Pydantic settings (reads .env)
-│   ├── server.py                  # FastAPI app + webhook handler + dashboard API
+│   ├── server.py                  # FastAPI app + webhook handler + dashboard API + review cancellation
 │   ├── reporting.py               # Execution report: console table, structlog, reports/*.json
 │   ├── static/
-│   │   └── dashboard.html         # Self-contained dashboard (served at /dashboard)
+│   │   ├── dashboard.html         # Self-contained dashboard (served at /dashboard)
+│   │   └── login.html             # Active Directory sign-in form (served at /login)
+│   ├── auth/
+│   │   ├── ldap_auth.py           # Binds to AD as the user; group check
+│   │   ├── session.py             # Signed, expiring session cookie (no server-side store)
+│   │   └── deps.py                # require_user — the gate on every reporting endpoint
 │   ├── agents/
 │   │   ├── base_agent.py          # Abstract base + JSON parser
 │   │   ├── coordinator.py         # Orchestrator
@@ -627,6 +763,9 @@ code-review-agent/
 │       ├── diff_parser.py         # Unified diff parser
 │       └── process_runner.py      # Shared async subprocess runner (analyzers + hardware detection)
 ├── tests/
+│   ├── conftest.py                # signed_in_client / anonymous_client fixtures
+│   ├── test_auth.py               # the AD gate: who may read reports, and how a login can fail
+│   ├── test_cancel_review.py      # cancelling a running review, and telling the MR about it
 │   ├── test_agents.py
 │   ├── test_code_fixes.py         # applicable fixes: parsing, validation, GitLab suggestion rendering
 │   ├── test_reporting.py          # report JSON payload + dashboard read-side (path traversal guard)

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Configuration — Code Review Agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f3f0;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --border: rgba(11,11,11,0.10);
+    --accent: #2a78d6; --accent-wash: rgba(42,120,214,0.10);
+    --critical: #d03b3b; --good: #1f9d55; --warning: #fab219;
+    --shadow: 0 1px 2px rgba(0,0,0,.05), 0 6px 20px rgba(0,0,0,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222221;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --border: rgba(255,255,255,0.10);
+      --accent: #3987e5; --accent-wash: rgba(57,135,229,0.16); --shadow: none;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222221;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --border: rgba(255,255,255,0.10);
+    --accent: #3987e5; --accent-wash: rgba(57,135,229,0.16); --shadow: none;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--page); color: var(--ink); }
+  body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 96px; }
+  header { margin-bottom: 18px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .nav { display: flex; gap: 14px; margin-top: 6px; font-size: 13px; }
+  .nav a { color: var(--accent); text-decoration: none; }
+  .nav a[aria-current] { color: var(--ink); font-weight: 600; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow);
+          padding: 6px 18px 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; margin: 12px 0 6px; }
+  .field { display: grid; grid-template-columns: minmax(150px, 220px) 1fr; gap: 4px 14px; align-items: start; padding: 8px 0;
+           border-top: 1px solid var(--border); }
+  .field:first-of-type { border-top: 0; }
+  .field > label { color: var(--ink-2); font-size: 13px; padding-top: 7px; }
+  .field .key { display: block; color: var(--muted); font: 11px ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  input[type=text], input[type=number], input[type=password], select, textarea {
+    font: inherit; color: var(--ink); background: var(--page); width: 100%;
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px;
+  }
+  textarea { font: 12.5px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; min-height: 150px; resize: vertical; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+  .field.dirty input, .field.dirty select, .field.dirty textarea { border-color: var(--accent); }
+  .help { grid-column: 2; font-size: 12px; color: var(--muted); }
+  .tag { font-size: 11px; color: var(--ink-2); border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; margin-left: 6px; }
+  .check { display: inline-flex; align-items: center; gap: 8px; padding-top: 6px; }
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--surface); border-top: 1px solid var(--border);
+         padding: 10px 16px; }
+  .bar .in { max-width: 880px; margin: 0 auto; display: flex; align-items: center; gap: 12px; }
+  .bar .msg { flex: 1; font-size: 13px; color: var(--ink-2); }
+  .bar .msg.err { color: var(--critical); }
+  .bar .msg.ok { color: var(--good); }
+  button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border);
+           border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+  button.primary { color: #fff; background: var(--accent); border-color: transparent; font-weight: 600; }
+  button:disabled { opacity: .55; cursor: default; }
+  .warn { border: 1px solid var(--border); border-left: 3px solid var(--warning); background: var(--surface-2);
+          border-radius: 8px; padding: 9px 12px; margin-bottom: 14px; font-size: 13px; }
+  @media (max-width: 600px) { .field { grid-template-columns: 1fr; } .help { grid-column: 1; } .field > label { padding-top: 0; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Configuration</h1>
+    <nav class="nav"><a href="/">Home</a> <a href="/dashboard">Reports</a> <a href="/config" aria-current="page">Configuration</a></nav>
+  </header>
+  <div class="warn">
+    Changes are written to the server's <code>.env</code> file. Secrets are never shown — leave a masked value
+    as it is to keep it. Leaving the sign-in settings wrong can lock everyone out, including you.
+  </div>
+  <div id="form">Loading…</div>
+</div>
+
+<div class="bar"><div class="in">
+  <span class="msg" id="msg"></span>
+  <button id="reset" disabled>Discard changes</button>
+  <button id="save" class="primary" disabled>Save changes</button>
+</div></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let original = {}, mask = "********", dirty = new Set(), inputs = {};
+
+async function api(url, opts) {
+  const res = await fetch(url, Object.assign({ credentials: "same-origin" }, opts || {}));
+  if (res.status === 401) location.replace("/login?reason=expired&next=/config");
+  return res;
+}
+
+function say(text, kind) { const m = $("#msg"); m.textContent = text || ""; m.className = "msg " + (kind || ""); }
+
+function build(data) {
+  original = data.values; mask = data.secret_mask; dirty.clear(); inputs = {};
+  const root = $("#form"); root.textContent = "";
+  for (const g of data.groups) {
+    const card = document.createElement("section"); card.className = "card";
+    const h = document.createElement("h2"); h.textContent = g.title; card.append(h);
+    for (const f of g.fields) card.append(field(f, original[f.key] ?? ""));
+    root.append(card);
+  }
+  refresh();
+}
+
+function field(f, value) {
+  const wrap = document.createElement("div"); wrap.className = "field";
+  const label = document.createElement("label"); label.htmlFor = "f-" + f.key;
+  label.textContent = f.label;
+  if (f.restart) { const t = document.createElement("span"); t.className = "tag"; t.textContent = "restart"; label.append(t); }
+  const key = document.createElement("span"); key.className = "key"; key.textContent = f.key; label.append(key);
+
+  let el;
+  if (f.kind === "select") {
+    el = document.createElement("select");
+    const opts = f.options.includes(value) || !value ? f.options : [value, ...f.options];
+    for (const o of opts) { const op = document.createElement("option"); op.value = op.textContent = o; el.append(op); }
+    el.value = value || f.options[0];
+  } else if (f.kind === "bool") {
+    el = document.createElement("input"); el.type = "checkbox";
+    el.checked = String(value).toLowerCase() === "true";
+  } else if (f.kind === "json") {
+    el = document.createElement("textarea"); el.value = value; el.spellcheck = false;
+  } else {
+    el = document.createElement("input");
+    el.type = f.kind === "secret" ? "password" : f.kind === "number" ? "number" : "text";
+    el.value = value; el.autocomplete = "off"; el.spellcheck = false;
+  }
+  el.id = "f-" + f.key;
+  const read = () => f.kind === "bool" ? String(el.checked) : el.value;
+  const onChange = () => {
+    const changed = read() !== normalized(f, original[f.key] ?? "");
+    wrap.classList.toggle("dirty", changed);
+    changed ? dirty.add(f.key) : dirty.delete(f.key);
+    refresh();
+  };
+  el.addEventListener("input", onChange); el.addEventListener("change", onChange);
+  inputs[f.key] = { el, read, f };
+
+  if (f.kind === "bool") { const c = document.createElement("label"); c.className = "check"; c.htmlFor = el.id; c.append(el, document.createTextNode(" enabled")); wrap.append(label, c); }
+  else wrap.append(label, el);
+  if (f.help) { const hp = document.createElement("div"); hp.className = "help"; hp.textContent = f.help; wrap.append(hp); }
+  return wrap;
+}
+
+const normalized = (f, v) => f.kind === "bool" ? String(String(v).toLowerCase() === "true") : f.kind === "select" && !v ? f.options[0] : v;
+
+function refresh() {
+  $("#save").disabled = dirty.size === 0; $("#reset").disabled = dirty.size === 0;
+  if (dirty.size) say(dirty.size + " unsaved change" + (dirty.size > 1 ? "s" : ""));
+}
+
+async function load() {
+  const res = await api("/api/config");
+  if (res.status === 403) { location.replace("/?reason=admin"); return; }
+  if (!res.ok) { $("#form").textContent = "Could not load the configuration (" + res.status + ")."; return; }
+  build(await res.json());
+}
+
+$("#reset").addEventListener("click", load);
+$("#save").addEventListener("click", async () => {
+  const values = {};
+  for (const k of dirty) values[k] = inputs[k].read();
+  $("#save").disabled = true; say("Saving…");
+  try {
+    const res = await api("/api/config", { method: "PUT", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ values }) });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) { say(j.detail || ("Save failed (" + res.status + ")."), "err"); $("#save").disabled = false; return; }
+    await load(); say(j.message || "Saved.", j.applied ? "ok" : "");
+  } catch (e) { say("Could not reach the server.", "err"); $("#save").disabled = false; }
+});
+
+window.addEventListener("beforeunload", e => { if (dirty.size) { e.preventDefault(); e.returnValue = ""; } });
+load();
+</script>
+</body>
+</html>

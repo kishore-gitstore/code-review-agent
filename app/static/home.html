@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Home — Code Review Agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f3f0;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --border: rgba(11,11,11,0.10);
+    --accent: #2a78d6; --accent-wash: rgba(42,120,214,0.10);
+    --critical: #d03b3b; --good: #1f9d55; --warning: #fab219;
+    --shadow: 0 1px 2px rgba(0,0,0,.05), 0 6px 20px rgba(0,0,0,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222221;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --border: rgba(255,255,255,0.10);
+      --accent: #3987e5; --accent-wash: rgba(57,135,229,0.16); --shadow: none;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222221;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --border: rgba(255,255,255,0.10);
+    --accent: #3987e5; --accent-wash: rgba(57,135,229,0.16); --shadow: none;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--page); color: var(--ink); }
+  body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 22px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .who { display: flex; align-items: center; gap: 10px; color: var(--ink-2); font-size: 13px; }
+  button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border);
+           border-radius: 8px; padding: 7px 12px; cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--surface-2); }
+  button:disabled { opacity: .55; cursor: default; }
+  .link-btn { border: 0; background: transparent; color: var(--ink-2); padding: 3px 6px; }
+  .banner { border: 1px solid var(--border); border-left: 3px solid var(--warning); background: var(--surface-2);
+            border-radius: 8px; padding: 9px 12px; margin-bottom: 16px; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  .tile { display: block; text-decoration: none; color: inherit; background: var(--surface);
+          border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); padding: 18px; }
+  a.tile:hover { border-color: var(--accent); background: var(--accent-wash); }
+  .tile h2 { font-size: 15px; margin: 0 0 4px; }
+  .tile p { margin: 0; color: var(--ink-2); font-size: 13px; }
+  .tile.off { opacity: .55; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow);
+          padding: 18px; margin-top: 14px; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .state { display: inline-flex; align-items: center; gap: 7px; font-weight: 650; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--good); }
+  .state.stopped .dot { background: var(--critical); }
+  .muted { color: var(--muted); font-size: 13px; }
+  .btn-start { color: #fff; background: var(--good); border-color: transparent; }
+  .btn-start:hover:not(:disabled) { background: var(--good); filter: brightness(1.08); }
+  .btn-stop { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Code Review Agent</h1>
+    <div class="who">
+      <span id="who"></span>
+      <button class="link-btn" id="signout" hidden>Sign out</button>
+    </div>
+  </header>
+
+  <div class="banner" id="denied" hidden>That page is for administrators only.</div>
+
+  <div class="grid">
+    <a class="tile" href="/dashboard">
+      <h2>Reports</h2>
+      <p>Review history, live progress and per-MR findings.</p>
+    </a>
+    <a class="tile" id="tile-config" href="/config" hidden>
+      <h2>Configuration</h2>
+      <p>Edit environment variables: LLM provider, GitLab, agents, sign-in.</p>
+    </a>
+  </div>
+
+  <section class="card" aria-labelledby="svc-h">
+    <h2 id="svc-h">Review service</h2>
+    <div class="row">
+      <span class="state" id="state"><span class="dot"></span><span id="state-text">…</span></span>
+      <span class="muted" id="detail"></span>
+      <span style="flex:1"></span>
+      <button class="btn-start" id="start" hidden>Start</button>
+      <button class="btn-stop" id="stop" hidden>Stop</button>
+    </div>
+    <p class="muted" style="margin:10px 0 0">
+      Stopping makes the agent ignore new merge-request events and refuse manual triggers. Reviews already running
+      finish normally; this page and the dashboard stay available.
+    </p>
+  </section>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let busy = false;
+
+async function api(url, opts) {
+  const res = await fetch(url, Object.assign({ credentials: "same-origin" }, opts || {}));
+  if (res.status === 401) { location.replace("/login?reason=expired&next=/"); }
+  return res;
+}
+
+async function loadMe() {
+  const res = await api("/api/me"); if (!res.ok) return;
+  const me = await res.json();
+  if (me.auth_enabled && me.user) {
+    $("#who").textContent = me.user.display_name || me.user.username;
+    $("#signout").hidden = false;
+  }
+  if (me.is_admin) $("#tile-config").hidden = false;
+}
+
+async function loadService() {
+  const res = await api("/api/service"); if (!res.ok) return;
+  const s = await res.json();
+  const running = s.state === "running";
+  $("#state").classList.toggle("stopped", !running);
+  $("#state-text").textContent = running ? "Running" : "Stopped";
+  const bits = [];
+  if (s.running_reviews) bits.push(s.running_reviews + " review(s) in progress");
+  if (s.changed_by) bits.push((running ? "started" : "stopped") + " by " + s.changed_by + " at " + s.changed_at);
+  $("#detail").textContent = bits.join(" · ");
+  $("#start").hidden = !(s.can_control && !running);
+  $("#stop").hidden = !(s.can_control && running);
+}
+
+async function toggle(action) {
+  if (busy) return; busy = true;
+  const btn = $("#" + action); btn.disabled = true;
+  try {
+    const res = await api("/api/service/" + action, { method: "POST" });
+    if (!res.ok) alert("Could not " + action + " the service (" + res.status + ").");
+  } finally { btn.disabled = false; busy = false; loadService(); }
+}
+
+$("#start").addEventListener("click", () => toggle("start"));
+$("#stop").addEventListener("click", () => {
+  if (confirm("Stop accepting new reviews? Running reviews will finish.")) toggle("stop");
+});
+$("#signout").addEventListener("click", async () => {
+  try { await fetch("/api/logout", { method: "POST", credentials: "same-origin" }); } catch (e) {}
+  location.replace("/login");
+});
+
+if (new URLSearchParams(location.search).get("reason") === "admin") $("#denied").hidden = false;
+loadMe(); loadService(); setInterval(loadService, 10000);
+</script>
+</body>
+</html>

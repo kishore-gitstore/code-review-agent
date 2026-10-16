@@ -162,5 +162,7 @@ log "Setup complete."
 echo
 echo "Next steps:"
 echo "  1. Edit .env — set GITLAB_INSTANCES and the ${LLM_PROVIDER} provider key/config."
+echo "     Dashboard login: set LDAP_SERVER/LDAP_DOMAIN and a SESSION_SECRET,"
+echo "     or AUTH_ENABLED=false to leave the dashboard open (dev boxes only)."
 echo "  2. Start the server: setup/linux/run.sh"
 echo "  3. Point a GitLab webhook at http://<this-host>:8000/webhook/gitlab/<instance-name>"
