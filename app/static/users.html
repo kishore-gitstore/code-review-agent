@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Users — Code Review Agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f3f0;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --border: rgba(11,11,11,0.10);
+    --accent: #2a78d6; --accent-wash: rgba(42,120,214,0.10);
+    --critical: #d03b3b; --good: #1f9d55; --warning: #fab219;
+    --shadow: 0 1px 2px rgba(0,0,0,.05), 0 6px 20px rgba(0,0,0,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222221;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --border: rgba(255,255,255,0.10);
+      --accent: #3987e5; --accent-wash: rgba(57,135,229,0.16); --shadow: none;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222221;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --border: rgba(255,255,255,0.10);
+    --accent: #3987e5; --accent-wash: rgba(57,135,229,0.16); --shadow: none;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--page); color: var(--ink); }
+  body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 18px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .nav { display: flex; gap: 14px; margin-top: 6px; font-size: 13px; flex-wrap: wrap; }
+  .nav a { color: var(--accent); text-decoration: none; }
+  .nav a[aria-current] { color: var(--ink); font-weight: 600; }
+  .who { display: flex; align-items: center; gap: 10px; color: var(--ink-2); font-size: 13px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow);
+          padding: 16px 18px; margin-bottom: 14px; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border);
+           border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--surface-2); }
+  button:disabled { opacity: .55; cursor: default; }
+  button.primary { color: #fff; background: var(--accent); border-color: transparent; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: var(--accent); filter: brightness(1.08); }
+  button.danger { color: var(--critical); }
+  .link-btn { border: 0; background: transparent; color: var(--ink-2); padding: 3px 6px; }
+  .link-btn:hover:not(:disabled) { background: transparent; color: var(--ink); text-decoration: underline; }
+  .signout { font: inherit; font-size: 13px; font-weight: 600; color: var(--ink); background: var(--surface);
+             border: 1px solid var(--border); border-radius: 8px; padding: 5px 12px; cursor: pointer; }
+  .signout:hover { background: var(--surface-2); }
+  input[type=text], input[type=password] {
+    font: inherit; color: var(--ink); background: var(--page); width: 100%;
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px;
+  }
+  input:focus { outline: 2px solid var(--accent-wash); border-color: var(--accent); }
+  .form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 12px; align-items: end; }
+  .form label.f { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--ink-2); }
+  .form .foot { grid-column: 1 / -1; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-2); }
+  .msg { font-size: 13px; color: var(--ink-2); min-height: 1.45em; }
+  .msg.err { color: var(--critical); }
+  .msg.ok { color: var(--good); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 6px; border-top: 1px solid var(--border); vertical-align: middle; }
+  th { font-size: 12px; font-weight: 600; color: var(--muted); border-top: 0; }
+  td.actions { text-align: right; white-space: nowrap; }
+  td.actions button { margin-left: 6px; }
+  .role { font-size: 12px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; color: var(--ink-2); }
+  .role.admin { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+  .you { font-size: 12px; color: var(--muted); margin-left: 6px; }
+  dialog { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--ink);
+           padding: 18px; width: min(380px, calc(100vw - 32px)); box-shadow: var(--shadow); }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  dialog h2 { font-size: 15px; margin: 0 0 12px; }
+  dialog label.f { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--ink-2); margin-bottom: 10px; }
+  dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+  [hidden] { display: none !important; }
+  @media (max-width: 640px) {
+    .form { grid-template-columns: 1fr; }
+    td.actions { white-space: normal; }
+    td.actions button { margin: 3px 0 3px 6px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Users</h1>
+      <nav class="nav">
+        <a href="/">Home</a> <a href="/dashboard">Reports</a> <a href="/config">Configuration</a>
+        <a href="/users" aria-current="page">Users</a>
+      </nav>
+    </div>
+    <div class="who">
+      <span id="who"></span>
+      <button class="signout" id="signout">Sign out</button>
+    </div>
+  </header>
+
+  <section class="card" aria-labelledby="add-h">
+    <h2 id="add-h">Register a user</h2>
+    <form class="form" id="add-form" autocomplete="off">
+      <label class="f">Username
+        <input type="text" id="add-name" required maxlength="64" pattern="[A-Za-z0-9._\-]{1,64}"
+               title="Letters, digits, '.', '_' and '-' only" spellcheck="false">
+      </label>
+      <label class="f">Password
+        <input type="password" id="add-pass" required autocomplete="new-password">
+      </label>
+      <label class="f">Repeat password
+        <input type="password" id="add-pass2" required autocomplete="new-password">
+      </label>
+      <div class="foot">
+        <label class="check"><input type="checkbox" id="add-admin"> Administrator (Home, Configuration, Users)</label>
+        <span style="flex:1"></span>
+        <button class="primary" type="submit" id="add-btn">Register</button>
+      </div>
+    </form>
+    <div class="msg" id="add-msg"></div>
+  </section>
+
+  <section class="card" aria-labelledby="list-h">
+    <h2 id="list-h">Local accounts</h2>
+    <div class="msg" id="list-msg"></div>
+    <table id="table" hidden>
+      <thead><tr><th>Username</th><th>Role</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p class="muted" style="margin:10px 0 0">
+      Changes take effect at the user's next sign-in. Active Directory users aren't listed here — make them admins
+      with <code>ADMIN_USERS</code> or <code>ADMIN_GROUP</code> on the Configuration page.
+    </p>
+  </section>
+</div>
+
+<dialog id="pw-dialog">
+  <form id="pw-form" method="dialog" autocomplete="off">
+    <h2>Reset password for <span id="pw-name"></span></h2>
+    <label class="f">New password <input type="password" id="pw-pass" required autocomplete="new-password"></label>
+    <label class="f">Repeat password <input type="password" id="pw-pass2" required autocomplete="new-password"></label>
+    <div class="msg" id="pw-msg"></div>
+    <div class="row">
+      <button type="button" id="pw-cancel">Cancel</button>
+      <button type="submit" class="primary" id="pw-save">Save password</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+let me = "", minLen = 8, users = [];
+
+async function api(url, opts) {
+  const res = await fetch(url, Object.assign({ credentials: "same-origin" }, opts || {}));
+  if (res.status === 401) { location.replace("/login?reason=expired&next=/users"); throw new Error("signed out"); }
+  if (res.status === 403) { location.replace("/dashboard"); throw new Error("not an admin"); }
+  return res;
+}
+
+async function post(url, body) {
+  const res = await api(url, { method: "POST", headers: { "Content-Type": "application/json" },
+                               body: JSON.stringify(body || {}) });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j.detail || ("Request failed (" + res.status + ")."));
+  return j;
+}
+
+function say(el, text, kind) { el.textContent = text || ""; el.className = "msg " + (kind || ""); }
+
+function render() {
+  const tbody = $("#rows"); tbody.textContent = "";
+  $("#table").hidden = users.length === 0;
+  if (!users.length) say($("#list-msg"), "No local accounts yet.");
+  else say($("#list-msg"), "");
+  for (const u of users) {
+    const tr = document.createElement("tr");
+    const self = u.username === me;
+
+    const tdName = document.createElement("td"); tdName.textContent = u.username;
+    if (self) { const y = document.createElement("span"); y.className = "you"; y.textContent = "(you)"; tdName.append(y); }
+
+    const tdRole = document.createElement("td");
+    const role = document.createElement("span"); role.className = "role" + (u.is_admin ? " admin" : "");
+    role.textContent = u.is_admin ? "Admin" : "User"; tdRole.append(role);
+
+    const tdAct = document.createElement("td"); tdAct.className = "actions";
+    const reset = document.createElement("button"); reset.textContent = "Reset password";
+    reset.addEventListener("click", () => openReset(u.username));
+    const toggle = document.createElement("button");
+    toggle.textContent = u.is_admin ? "Remove admin" : "Make admin";
+    toggle.disabled = self; if (self) toggle.title = "You can't change your own role";
+    toggle.addEventListener("click", () => setAdmin(u.username, !u.is_admin));
+    const remove = document.createElement("button"); remove.className = "danger"; remove.textContent = "Remove";
+    remove.disabled = self; if (self) remove.title = "You can't remove your own account";
+    remove.addEventListener("click", () => removeUser(u.username));
+    tdAct.append(reset, toggle, remove);
+
+    tr.append(tdName, tdRole, tdAct);
+    tbody.append(tr);
+  }
+}
+
+async function load() {
+  try {
+    const res = await api("/api/users");
+    if (!res.ok) { say($("#list-msg"), "Could not load users (" + res.status + ").", "err"); return; }
+    const j = await res.json();
+    users = j.users; me = j.me; minLen = j.min_password || 8;
+    render();
+  } catch (e) { if (e.message !== "signed out" && e.message !== "not an admin") say($("#list-msg"), "Could not reach the server.", "err"); }
+}
+
+async function loadMe() {
+  try {
+    const res = await api("/api/me"); if (!res.ok) return;
+    const j = await res.json();
+    if (j.user) $("#who").textContent = j.user.display_name || j.user.username;
+  } catch (e) {}
+}
+
+function checkPasswords(a, b) {
+  if (a.length < minLen) return "Use at least " + minLen + " characters for the password.";
+  if (a !== b) return "The passwords don't match.";
+  return "";
+}
+
+$("#add-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const name = $("#add-name").value.trim().toLowerCase();
+  const msg = $("#add-msg");
+  if (users.some(u => u.username === name)) {
+    say(msg, "User '" + name + "' is already registered. Use Reset password in the list below to change it.", "err");
+    return;
+  }
+  const problem = checkPasswords($("#add-pass").value, $("#add-pass2").value);
+  if (problem) { say(msg, problem, "err"); return; }
+  $("#add-btn").disabled = true; say(msg, "Saving…");
+  try {
+    const j = await post("/api/users", { username: name, password: $("#add-pass").value,
+                                         is_admin: $("#add-admin").checked });
+    users = j.users; render();
+    $("#add-form").reset();
+    say(msg, "Registered " + j.username + ". They can sign in now.", "ok");
+  } catch (err) { say(msg, err.message, "err"); }
+  finally { $("#add-btn").disabled = false; }
+});
+
+let resetFor = "";
+function openReset(name) {
+  resetFor = name; $("#pw-name").textContent = name;
+  $("#pw-form").reset(); say($("#pw-msg"), "");
+  $("#pw-dialog").showModal(); $("#pw-pass").focus();
+}
+$("#pw-cancel").addEventListener("click", () => $("#pw-dialog").close());
+$("#pw-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const msg = $("#pw-msg");
+  const problem = checkPasswords($("#pw-pass").value, $("#pw-pass2").value);
+  if (problem) { say(msg, problem, "err"); return; }
+  $("#pw-save").disabled = true; say(msg, "Saving…");
+  try {
+    const j = await post("/api/users/" + encodeURIComponent(resetFor) + "/password", { password: $("#pw-pass").value });
+    users = j.users; render();
+    $("#pw-dialog").close();
+    say($("#list-msg"), "Password for " + j.username + " changed.", "ok");
+  } catch (err) { say(msg, err.message, "err"); }
+  finally { $("#pw-save").disabled = false; }
+});
+
+async function setAdmin(name, admin) {
+  if (!confirm((admin ? "Make " + name + " an administrator?" : "Remove admin rights from " + name + "?"))) return;
+  try {
+    const j = await post("/api/users/" + encodeURIComponent(name) + "/admin", { is_admin: admin });
+    users = j.users; render();
+    say($("#list-msg"), name + (admin ? " is now an admin." : " is no longer an admin."), "ok");
+  } catch (err) { say($("#list-msg"), err.message, "err"); }
+}
+
+async function removeUser(name) {
+  if (!confirm("Remove the account " + name + "? They won't be able to sign in.")) return;
+  try {
+    const j = await post("/api/users/" + encodeURIComponent(name) + "/remove");
+    users = j.users; render();
+    say($("#list-msg"), "Removed " + name + ".", "ok");
+  } catch (err) { say($("#list-msg"), err.message, "err"); }
+}
+
+$("#signout").addEventListener("click", async () => {
+  try { await fetch("/api/logout", { method: "POST", credentials: "same-origin" }); } catch (e) {}
+  location.replace("/login");
+});
+
+loadMe();
+load();
+</script>
+</body>
+</html>

@@ -42,6 +42,9 @@
   button:hover:not(:disabled) { background: var(--surface-2); }
   button:disabled { opacity: .55; cursor: default; }
   .link-btn { border: 0; background: transparent; color: var(--ink-2); padding: 3px 6px; }
+  .signout { font: inherit; font-size: 13px; font-weight: 600; color: var(--ink); background: var(--surface);
+             border: 1px solid var(--border); border-radius: 8px; padding: 5px 12px; cursor: pointer; }
+  .signout:hover { background: var(--surface-2); }
   .banner { border: 1px solid var(--border); border-left: 3px solid var(--warning); background: var(--surface-2);
             border-radius: 8px; padding: 9px 12px; margin-bottom: 16px; font-size: 13px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
@@ -71,7 +74,7 @@
     <h1>Code Review Agent</h1>
     <div class="who">
       <span id="who"></span>
-      <button class="link-btn" id="signout" hidden>Sign out</button>
+      <button class="signout" id="signout">Sign out</button>
     </div>
   </header>
 
@@ -85,6 +88,10 @@
     <a class="tile" id="tile-config" href="/config" hidden>
       <h2>Configuration</h2>
       <p>Edit environment variables: LLM provider, GitLab, agents, sign-in.</p>
+    </a>
+    <a class="tile" id="tile-users" href="/users" hidden>
+      <h2>Users</h2>
+      <p>Register dashboard users, reset passwords, grant admin rights.</p>
     </a>
   </div>
 
@@ -120,9 +127,8 @@ async function loadMe() {
   const me = await res.json();
   if (me.user) {
     $("#who").textContent = me.user.display_name || me.user.username;
-    $("#signout").hidden = false;
   }
-  if (me.is_admin) $("#tile-config").hidden = false;
+  if (me.is_admin) { $("#tile-config").hidden = false; $("#tile-users").hidden = false; }
 }
 
 async function loadService() {

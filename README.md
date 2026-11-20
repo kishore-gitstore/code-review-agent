@@ -546,16 +546,34 @@ usable together:
 ### Local accounts
 
 Kept in `.env` as `LOCAL_USERS` — usernames with salted PBKDF2-SHA256 hashes,
-never clear-text passwords. Manage them on the server:
+never clear-text passwords.
 
-```bash
-python -m app.auth.local_users add admin --admin   # prompts for the password; --admin also adds to ADMIN_USERS
-python -m app.auth.local_users add alice           # a read-only dashboard user
-python -m app.auth.local_users list
-python -m app.auth.local_users remove alice
+**From the browser (admins):** the **Users** page (`/users`, linked from Home,
+Reports and Configuration) registers users, resets passwords, grants or
+removes admin rights and removes accounts. Changes work at the next sign-in,
+no restart needed. Registering a name that already exists is refused (use
+Reset password instead), and an admin can't demote or remove themselves there.
+
+**On the server:** the first admin has to be created here, since nobody can
+sign in yet. The helper script always uses the project's venv (the system
+`python` usually lacks the app's packages and fails with
+`No module named 'structlog'`):
+
+```powershell
+.\setup\windows\manage-users.ps1                     # interactive menu
+.\setup\windows\manage-users.ps1 add admin -Admin    # prompts for the password; -Admin also adds to ADMIN_USERS
+.\setup\windows\manage-users.ps1 add alice           # a dashboard-only user (refused if alice already exists)
+.\setup\windows\manage-users.ps1 reset alice         # change an existing user's password
+.\setup\windows\manage-users.ps1 list
+.\setup\windows\manage-users.ps1 remove alice
 ```
 
-Restart the service afterwards. A local username is checked against its local
+On Linux/macOS use `./setup/linux/manage-users.sh` (or `setup/macos/`) with
+the same commands, `--admin` instead of `-Admin`. Both wrap
+`venv/…/python -m app.auth.local_users`. If you edit `LOCAL_USERS` by hand,
+keep the value in single quotes, since the hashes contain `$`.
+
+After a script or hand edit, restart the service. A local username is checked against its local
 password only — it never falls through to AD — so an AD account that happens
 to share the name can't sign in as it. With neither `LOCAL_USERS` nor
 `LDAP_SERVER` set, nobody can sign in; the service logs
@@ -676,7 +694,7 @@ already finished is refused with a **409** rather than reported as cancelled.
 | `CLANG_TIDY_ARGS`         | `-- -std=c++17`              | Fallback compiler flags used only when no `compile_commands.json` is found under the checkout |
 | `SPOTBUGS_CMD`            | `spotbugs`                  | SpotBugs (Java) — binary name or full path |
 | `SPOTBUGS_CLASSES_DIRS`   | `target/classes,build/classes/java/main` | Comma-separated candidate build-output directories, checked in order; first one that exists is used |
-| `LOCAL_USERS`             | *(empty)*                   | Local dashboard accounts (`name:pbkdf2-hash,…`) — manage with `python -m app.auth.local_users`, see [Dashboard Login](#dashboard-login-local-accounts-and-active-directory) |
+| `LOCAL_USERS`             | *(empty)*                   | Local dashboard accounts (`name:pbkdf2-hash,…`) — manage with `setup/<os>/manage-users`, see [Dashboard Login](#dashboard-login-local-accounts-and-active-directory) |
 | `LDAP_SERVER`             | *(empty)*                   | Domain controller: bare host, `host:port`, or a URL. `ldaps://` forces TLS |
 | `LDAP_PORT`               | `0`                         | `0` → 636 with SSL, 389 without |
 | `LDAP_USE_SSL`            | `true`                      | Plain LDAP sends the password in clear text |

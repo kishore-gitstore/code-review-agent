@@ -68,9 +68,12 @@
   [hidden] { display: none !important; }
 
   /* ── header + filters ────────────────────────────────────────────────── */
-  .top { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 14px; }
+  .top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 14px; }
   .sub { margin: 2px 0 0; color: var(--ink-2); font-size: 13px; }
-  .top-right { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--ink-2); white-space: nowrap; }
+  .top-right { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px 12px; font-size: 13px; color: var(--ink-2); white-space: nowrap; }
+  .signout { font: inherit; font-size: 13px; font-weight: 600; color: var(--ink); background: var(--surface);
+             border: 1px solid var(--border); border-radius: 8px; padding: 5px 12px; cursor: pointer; }
+  .signout:hover { background: var(--surface-2); }
   .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
           border: 1px solid var(--border); background: var(--surface); color: var(--ink); font-weight: 600; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; }
@@ -250,14 +253,14 @@
   <div>
     <h1>Code Review Agent</h1>
     <p class="sub" id="sub">Loading…</p>
-    <nav class="nav"><a href="/" id="nav-home" hidden>Home</a> <a href="/dashboard" aria-current="page">Reports</a> <a href="/config" id="nav-config" hidden>Configuration</a></nav>
+    <nav class="nav"><a href="/" id="nav-home" hidden>Home</a> <a href="/dashboard" aria-current="page">Reports</a> <a href="/config" id="nav-config" hidden>Configuration</a> <a href="/users" id="nav-users" hidden>Users</a></nav>
   </div>
   <div class="top-right">
     <span class="pill" id="live-pill" hidden><span class="dot pulse"></span><span id="live-count"></span></span>
     <span class="muted" id="refreshed"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
     <span class="pill user-pill" id="user-pill" hidden><i></i><span id="user-name"></span></span>
-    <button class="link-btn" id="signout-btn" hidden>Sign out</button>
+    <button class="signout" id="signout-btn">Sign out</button>
     <button class="theme-btn" id="theme-btn" aria-label="Toggle theme">◐</button>
   </div>
 </header>
@@ -411,12 +414,11 @@ async function loadUser() {
   catch (e) { return; }
   // Home (the admin console) and Configuration are admin-only pages; the
   // server refuses them anyway, so non-admins simply don't see the links.
-  if (info && info.is_admin) { $("#nav-home").hidden = false; $("#nav-config").hidden = false; }
+  if (info && info.is_admin) { $("#nav-home").hidden = false; $("#nav-config").hidden = false; $("#nav-users").hidden = false; }
   if (!info || !info.user) return;
   $("#user-name").textContent = info.user.display_name || info.user.username;
   $("#user-pill").title = info.user.email || info.user.username;
   $("#user-pill").hidden = false;
-  $("#signout-btn").hidden = false;
 }
 
 $("#signout-btn").addEventListener("click", async () => {

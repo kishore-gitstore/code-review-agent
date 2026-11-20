@@ -34,7 +34,13 @@
   html, body { margin: 0; background: var(--page); color: var(--ink); }
   body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
   .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 96px; }
-  header { margin-bottom: 18px; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 18px; }
+  .who { display: flex; align-items: center; gap: 10px; color: var(--ink-2); font-size: 13px; }
+  .link-btn { border: 0; background: transparent; color: var(--ink-2); padding: 3px 6px; }
+  .link-btn:hover { color: var(--ink); text-decoration: underline; }
+  .signout { font: inherit; font-size: 13px; font-weight: 600; color: var(--ink); background: var(--surface);
+             border: 1px solid var(--border); border-radius: 8px; padding: 5px 12px; cursor: pointer; }
+  .signout:hover { background: var(--surface-2); }
   h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
   .nav { display: flex; gap: 14px; margin-top: 6px; font-size: 13px; }
   .nav a { color: var(--accent); text-decoration: none; }
@@ -75,8 +81,14 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Configuration</h1>
-    <nav class="nav"><a href="/">Home</a> <a href="/dashboard">Reports</a> <a href="/config" aria-current="page">Configuration</a></nav>
+    <div>
+      <h1>Configuration</h1>
+      <nav class="nav"><a href="/">Home</a> <a href="/dashboard">Reports</a> <a href="/config" aria-current="page">Configuration</a> <a href="/users">Users</a></nav>
+    </div>
+    <div class="who">
+      <span id="who"></span>
+      <button class="signout" id="signout">Sign out</button>
+    </div>
   </header>
   <div class="warn">
     Changes are written to the server's <code>.env</code> file. Secrets are never shown — leave a masked value
@@ -182,6 +194,15 @@ $("#save").addEventListener("click", async () => {
     await load(); say(j.message || "Saved.", j.applied ? "ok" : "");
   } catch (e) { say("Could not reach the server.", "err"); $("#save").disabled = false; }
 });
+
+$("#signout").addEventListener("click", async () => {
+  dirty.clear();  // leaving on purpose: no "unsaved changes" prompt
+  try { await fetch("/api/logout", { method: "POST", credentials: "same-origin" }); } catch (e) {}
+  location.replace("/login");
+});
+api("/api/me").then(r => r.ok ? r.json() : null).then(j => {
+  if (j && j.user) $("#who").textContent = j.user.display_name || j.user.username;
+}).catch(() => {});
 
 window.addEventListener("beforeunload", e => { if (dirty.size) { e.preventDefault(); e.returnValue = ""; } });
 load();

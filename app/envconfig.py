@@ -179,6 +179,23 @@ def read_values(path: Path | None = None) -> dict[str, str]:
     return out
 
 
+def sync_process_env(keys, path: Path | None = None) -> None:
+    """Make keys the app just saved to .env win over stale process env vars.
+
+    run.ps1, run.sh and docker-compose's env_file all copy .env into the
+    process environment at startup, and pydantic-settings ranks environment
+    variables above the .env file. Without this, reload_settings() after a
+    save would keep the startup value — a user registered on the Users page
+    couldn't sign in until a restart. Only the keys just written are synced,
+    so a deliberate override (docker-compose's OLLAMA_BASE_URL) stays put
+    unless an admin edits that very setting.
+    """
+    values = read_values(path)
+    for key in keys:
+        if key in FIELDS and key in os.environ:
+            os.environ[key] = values.get(key, "")
+
+
 # ── GITLAB_INSTANCES masking ─────────────────────────────────────────────────
 
 _INSTANCE_SECRETS = ("token", "webhook_secret")

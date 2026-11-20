@@ -42,6 +42,7 @@ from app.auth.deps import (clear_session_cookie, current_user, is_admin,
                            require_admin, require_user, safe_next,
                            set_session_cookie)
 from app.auth.login import authenticate
+from app.auth import local_users
 from app.reporting import ExecutionReport, list_reports, read_report
 from app.utils.console import force_utf8_streams
 from app.utils.models import MRContext
@@ -464,6 +465,8 @@ def create_app() -> FastAPI:
         except envconfig.ConfigError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         log.warning("config.saved", by=user.username, keys=changed)
+        # Same stale-env problem as the Users page: what was just saved must win.
+        envconfig.sync_process_env(changed)
         if not changed:
             return {"changed": [], "applied": True, "restart_required": [],
                     "message": "No changes to save."}
@@ -493,6 +496,52 @@ def create_app() -> FastAPI:
         service.set(True, user.label)
         log.warning("service.started", by=user.username)
         return await service_status(user)
+
+    # ── Local user accounts (admin only) ──────────────────────────────────
+    @app.get("/users")
+    async def users_page(request: Request):
+        user = current_user(request)
+        if user is None:
+            return RedirectResponse("/login?next=/users", status_code=303)
+        if not is_admin(user):
+            return RedirectResponse("/dashboard", status_code=303)
+        return FileResponse(_STATIC_DIR / "users.html")
+
+    @app.get("/api/users")
+    async def users_list(user: AuthUser = Depends(require_admin)):
+        return {"users": local_users.list_users(), "me": user.username.lower(),
+                "min_password": local_users.MIN_PASSWORD_LEN}
+
+    @app.post("/api/users", status_code=201)
+    async def users_add(body: dict, user: AuthUser = Depends(require_admin)):
+        name = await _change_users(local_users.add_user, body.get("username", ""),
+                                   str(body.get("password") or ""), bool(body.get("is_admin")))
+        log.warning("users.added", user=name, admin=bool(body.get("is_admin")), by=user.username)
+        return {"status": "ok", "username": name, "users": local_users.list_users()}
+
+    @app.post("/api/users/{username}/password")
+    async def users_reset_password(username: str, body: dict,
+                                   user: AuthUser = Depends(require_admin)):
+        name = await _change_users(local_users.reset_password, username,
+                                   str(body.get("password") or ""))
+        log.warning("users.password_reset", user=name, by=user.username)
+        return {"status": "ok", "username": name, "users": local_users.list_users()}
+
+    @app.post("/api/users/{username}/admin")
+    async def users_set_admin(username: str, body: dict,
+                              user: AuthUser = Depends(require_admin)):
+        _not_self(username, user, "remove your own admin rights")
+        admin = bool(body.get("is_admin"))
+        name = await _change_users(local_users.set_admin, username, admin)
+        log.warning("users.admin_changed", user=name, admin=admin, by=user.username)
+        return {"status": "ok", "username": name, "users": local_users.list_users()}
+
+    @app.post("/api/users/{username}/remove")
+    async def users_remove(username: str, user: AuthUser = Depends(require_admin)):
+        _not_self(username, user, "remove your own account")
+        name = await _change_users(local_users.remove_user, username)
+        log.warning("users.removed", user=name, by=user.username)
+        return {"status": "ok", "username": name, "users": local_users.list_users()}
 
     # ── Progress endpoints ────────────────────────────────────────────────
     @app.get("/review/active")
@@ -734,6 +783,37 @@ def create_app() -> FastAPI:
         }, status_code=202)
 
     return app
+
+
+# One writer at a time: each account change is a read-modify-write of .env,
+# so two admins saving at once must not lose one of the edits.
+_users_lock = asyncio.Lock()
+
+
+async def _change_users(fn, *args):
+    """Run a local_users mutation off the event loop (hashing a password is
+    ~0.3s of CPU), then reload settings so the change works at the very next
+    sign-in — no restart needed."""
+    async with _users_lock:
+        try:
+            result = await asyncio.to_thread(fn, *args)
+        except local_users.UserExists as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except local_users.NoSuchUser as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except (local_users.UserError, envconfig.ConfigError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        envconfig.sync_process_env(("LOCAL_USERS", "ADMIN_USERS"))
+        reload_settings()
+        return result
+
+
+def _not_self(username: str, user: AuthUser, what: str) -> None:
+    """An admin can't lock themselves out from this page."""
+    if username.strip().lower() == user.username.lower():
+        raise HTTPException(status_code=400,
+                            detail=f"You can't {what} here — ask another admin, or use the "
+                                   "manage-users script on the server.")
 
 
 async def _apply_config(changed: list[str]) -> dict:
