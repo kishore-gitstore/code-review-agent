@@ -250,7 +250,7 @@
   <div>
     <h1>Code Review Agent</h1>
     <p class="sub" id="sub">Loading…</p>
-    <nav class="nav"><a href="/">Home</a> <a href="/dashboard" aria-current="page">Reports</a> <a href="/config" id="nav-config" hidden>Configuration</a></nav>
+    <nav class="nav"><a href="/" id="nav-home" hidden>Home</a> <a href="/dashboard" aria-current="page">Reports</a> <a href="/config" id="nav-config" hidden>Configuration</a></nav>
   </div>
   <div class="top-right">
     <span class="pill" id="live-pill" hidden><span class="dot pulse"></span><span id="live-count"></span></span>
@@ -409,10 +409,10 @@ async function loadUser() {
   let info;
   try { const res = await api("/api/me"); if (!res.ok) return; info = await res.json(); }
   catch (e) { return; }
-  if (info && info.is_admin) $("#nav-config").hidden = false;
-  // AUTH_ENABLED=false: there is no real identity to show, so show nothing
-  // rather than a chip reading "Anonymous" that implies a login happened.
-  if (!info || !info.auth_enabled || !info.user) return;
+  // Home (the admin console) and Configuration are admin-only pages; the
+  // server refuses them anyway, so non-admins simply don't see the links.
+  if (info && info.is_admin) { $("#nav-home").hidden = false; $("#nav-config").hidden = false; }
+  if (!info || !info.user) return;
   $("#user-name").textContent = info.user.display_name || info.user.username;
   $("#user-pill").title = info.user.email || info.user.username;
   $("#user-pill").hidden = false;

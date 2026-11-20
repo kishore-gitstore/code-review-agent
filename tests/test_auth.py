@@ -173,7 +173,7 @@ def test_api_me_reports_the_signed_in_identity(signed_in_client):
 
     assert body["user"]["username"] == "testuser"
     assert body["user"]["display_name"] == "Test User"
-    assert body["auth_enabled"] is True
+    assert body["is_admin"] is False
 
 
 # ── how a failed login is reported ──────────────────────────────────────────
@@ -233,13 +233,112 @@ def test_an_unset_api_token_cannot_be_matched_by_an_empty_header(anonymous_clien
     assert res.status_code == 401
 
 
-# ── the escape hatch ────────────────────────────────────────────────────────
+# ── there is no way to switch sign-in off ───────────────────────────────────
 
-def test_auth_can_be_turned_off_for_a_dev_box(anonymous_client, monkeypatch):
-    monkeypatch.setattr(get_settings(), "auth_enabled", False)
+def test_an_old_auth_enabled_false_no_longer_opens_the_dashboard(anonymous_client, monkeypatch):
+    """AUTH_ENABLED=false used to make every visitor an anonymous admin. An
+    old .env still carrying it must not reopen the dashboard."""
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    from app.settings import Settings
+    assert not hasattr(Settings(), "auth_enabled")
 
-    assert anonymous_client.get("/review/active").status_code == 200
-    assert anonymous_client.get("/dashboard", follow_redirects=False).status_code == 200
+    assert anonymous_client.get("/review/active").status_code == 401
+    r = anonymous_client.get("/dashboard", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"].startswith("/login")
+
+
+def test_signing_in_lands_on_the_dashboard(anonymous_client):
+    r = anonymous_client.get("/", follow_redirects=False)
+    assert r.headers["location"] == "/login?next=/dashboard"
+    assert deps.safe_next(None) == "/dashboard"
+
+
+# ── local accounts ──────────────────────────────────────────────────────────
+
+from app.auth import AuthConfigError, local_users
+from app.auth import login as login_mod
+
+
+@pytest.fixture
+def a_local_admin(monkeypatch):
+    # Few iterations: the cost factor isn't what's under test.
+    stored = local_users.hash_password("correct horse", iterations=1000)
+    monkeypatch.setattr(get_settings(), "local_users", f"admin:{stored},bad-entry")
+    return stored
+
+
+def test_a_password_hash_never_contains_the_password():
+    stored = local_users.hash_password("hunter22", iterations=1000)
+    assert "hunter22" not in stored
+    assert local_users.verify_password("hunter22", stored)
+    assert not local_users.verify_password("hunter23", stored)
+    assert not local_users.verify_password("hunter22", "garbage")
+
+
+def test_two_hashes_of_one_password_differ():
+    assert local_users.hash_password("same", iterations=1000) != \
+        local_users.hash_password("same", iterations=1000)
+
+
+@pytest.mark.asyncio
+async def test_a_local_user_signs_in_with_their_password(a_local_admin):
+    user = await login_mod.authenticate("Admin", "correct horse")
+    assert user.username == "admin"
+    with pytest.raises(InvalidCredentials):
+        await login_mod.authenticate("admin", "wrong")
+
+
+@pytest.mark.asyncio
+async def test_a_local_name_never_falls_through_to_active_directory(a_local_admin, monkeypatch):
+    """Otherwise an AD account named "admin" could sign in as the local admin."""
+    monkeypatch.setattr(get_settings(), "ldap_server", "dc01.corp.local")
+    with patch("app.auth.ldap_auth.authenticate", AsyncMock(return_value=TEST_USER)) as ad:
+        with pytest.raises(InvalidCredentials):
+            await login_mod.authenticate("admin", "wrong")
+    ad.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_other_names_go_to_active_directory_when_configured(a_local_admin, monkeypatch):
+    monkeypatch.setattr(get_settings(), "ldap_server", "dc01.corp.local")
+    with patch("app.auth.ldap_auth.authenticate", AsyncMock(return_value=TEST_USER)) as ad:
+        assert await login_mod.authenticate("testuser", "pw") is TEST_USER
+    ad.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_with_no_sign_in_method_the_error_says_how_to_add_one():
+    with pytest.raises(AuthConfigError) as exc:
+        await login_mod.authenticate("someone", "pw")
+    assert "local_users add" in exc.value.message
+
+
+def test_local_admin_rights_come_from_admin_users(monkeypatch):
+    monkeypatch.setattr(get_settings(), "admin_users", "admin")
+    assert deps.is_admin(AuthUser(username="admin"))
+    assert not deps.is_admin(AuthUser(username="viewer"))
+
+
+def test_the_cli_writes_a_hashed_admin_to_env(tmp_path, monkeypatch):
+    from app import envconfig
+    env = tmp_path / ".env"
+    env.write_text("LLM_PROVIDER=ollama\n", encoding="utf-8")
+    monkeypatch.setattr(envconfig, "ENV_PATH", env)
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "s3cret-pass")
+
+    assert local_users._main(["add", "Admin", "--admin"]) == 0
+
+    text = env.read_text(encoding="utf-8")
+    assert "s3cret-pass" not in text
+    values = envconfig.read_values(env)
+    assert values["ADMIN_USERS"] == "admin"
+    stored = local_users.parse(values["LOCAL_USERS"])["admin"]
+    assert local_users.verify_password("s3cret-pass", stored)
+
+    # And pydantic-settings reads the same value back ($ not interpolated).
+    from app.settings import Settings
+    monkeypatch.chdir(tmp_path)
+    assert local_users.parse(Settings().local_users)["admin"] == stored
 
 
 # ── open-redirect guard on ?next= ───────────────────────────────────────────
@@ -252,7 +351,7 @@ def test_auth_can_be_turned_off_for_a_dev_box(anonymous_client, monkeypatch):
     None,
 ])
 def test_next_cannot_be_pointed_off_site(hostile):
-    assert deps.safe_next(hostile) == "/"
+    assert deps.safe_next(hostile) == "/dashboard"
 
 
 def test_next_still_works_for_a_same_origin_path():

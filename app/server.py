@@ -34,13 +34,14 @@ from app.service_state import service
 from app.settings import get_settings, reload_settings
 from app.execution import detect_hardware, resolve_execution_policy, set_execution_policy
 from app.llm.factory import get_llm_client, reset_client
-from app.gitlab.client import GitLabClient, get_gitlab_client, UnknownGitLabInstance
+from app.gitlab.client import (GitLabClient, get_gitlab_client, UnknownGitLabInstance,
+                               failed_note_body)
 from app.agents.coordinator import CoordinatorAgent
 from app.auth import AuthError, AuthUser
 from app.auth.deps import (clear_session_cookie, current_user, is_admin,
                            require_admin, require_user, safe_next,
                            set_session_cookie)
-from app.auth.ldap_auth import authenticate
+from app.auth.login import authenticate
 from app.reporting import ExecutionReport, list_reports, read_report
 from app.utils.console import force_utf8_streams
 from app.utils.models import MRContext
@@ -76,6 +77,47 @@ def _spawn_detached(coro) -> asyncio.Task:
     _detached.add(task)
     task.add_done_callback(_detached.discard)
     return task
+
+
+# ── LLM model residency ───────────────────────────────────────────────────────
+# A self-hosted model (Ollama) holds gigabytes of RAM/VRAM while loaded. It is
+# loaded when a review reaches its LLM stage and unloaded the moment the LAST
+# review that needed it finishes — counted, so one review finishing doesn't
+# pull the model out from under another that's mid-request. Hosted providers'
+# load()/unload() are no-ops.
+_model_leases = 0
+
+
+async def _acquire_model() -> None:
+    global _model_leases
+    _model_leases += 1          # before any await: the caller's finally relies on it
+    if _model_leases == 1:
+        try:
+            await get_llm_client().load()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Not fatal: the first real request loads the model anyway, and
+            # if Ollama is genuinely down that request reports it properly.
+            log.warning("llm.load_failed", error=str(exc))
+
+
+def _release_model() -> None:
+    """Synchronous on purpose: called from _run_review's finally, which may
+    be unwinding a cancellation — the unload itself runs detached."""
+    global _model_leases
+    _model_leases = max(0, _model_leases - 1)
+    if _model_leases == 0 and get_settings().ollama_unload_after_review:
+        _spawn_detached(_unload_model_if_idle())
+
+
+async def _unload_model_if_idle() -> None:
+    if _model_leases:
+        return  # another review started in the meantime and needs it
+    try:
+        await get_llm_client().unload()
+    except Exception as exc:
+        log.warning("llm.unload_failed", error=str(exc))
 
 # ── In-memory review progress tracker ────────────────────────────────────────
 
@@ -295,6 +337,20 @@ async def _configure_runtime() -> None:
         log.warning("llm.unavailable", detail=health)
     else:
         log.info("llm.ready", provider=health.get("provider"), model=health["model"])
+        # A previous process that crashed mid-review (or the old behaviour of
+        # warming the model at startup) can leave it resident. Only called
+        # with no review running: startup, or apply_config's idle check.
+        if cfg.ollama_unload_after_review and _model_leases == 0:
+            try:
+                await get_llm_client().unload()
+            except Exception as exc:
+                log.warning("llm.unload_failed", error=str(exc))
+
+    if not cfg.ldap_server.strip() and not cfg.local_users.strip():
+        log.error("auth.no_sign_in_method",
+                  hint="Nobody can sign in to the dashboard. Add a local admin with: "
+                       "python -m app.auth.local_users add admin --admin "
+                       "(or set LDAP_SERVER/LDAP_DOMAIN for Active Directory).")
 
 
 def create_app() -> FastAPI:
@@ -321,7 +377,7 @@ def create_app() -> FastAPI:
 
     # ── Authentication ────────────────────────────────────────────────────
     @app.get("/login")
-    async def login_page(request: Request, next: str = "/"):
+    async def login_page(request: Request, next: str = "/dashboard"):
         """The sign-in form. Already signed in? Go straight through, so a
         bookmarked /login isn't a dead end."""
         if current_user(request) is not None:
@@ -332,23 +388,22 @@ def create_app() -> FastAPI:
     async def auth_info():
         """What the login page needs before anyone types anything. Returns the
         AD domain (so the form can label the username field) and nothing that
-        would help an attacker — no server address, no group names."""
+        would help an attacker — no server address, no group or user names."""
         cfg = get_settings()
-        return {"auth_enabled": cfg.auth_enabled, "domain": cfg.ldap_domain}
+        return {"domain": cfg.ldap_domain if cfg.ldap_server.strip() else ""}
 
     @app.post("/api/login")
     async def api_login(body: dict):
-        """Verify AD credentials and set the session cookie."""
-        cfg = get_settings()
-        if not cfg.auth_enabled:
-            return JSONResponse({"status": "ok", "user": None, "auth_enabled": False})
+        """Verify credentials (local account or AD) and set the session cookie."""
         try:
             user = await authenticate(body.get("username", ""), body.get("password", ""))
         except AuthError as exc:
             # Each AuthError subclass carries its own status, so a directory
             # outage (503) isn't reported to the user as a bad password (401).
             raise HTTPException(status_code=exc.http_status, detail=exc.message)
-        response = JSONResponse({"status": "ok", "user": user.as_dict()})
+        # Every user lands on the reports; the home page is the admin console.
+        response = JSONResponse({"status": "ok", "user": user.as_dict(),
+                                 "is_admin": is_admin(user)})
         set_session_cookie(response, user)
         return response
 
@@ -365,16 +420,19 @@ def create_app() -> FastAPI:
         user = current_user(request)
         if user is None:
             raise HTTPException(status_code=401, detail="Not signed in")
-        return {"user": user.as_dict(), "auth_enabled": get_settings().auth_enabled,
-                "is_admin": is_admin(user)}
+        return {"user": user.as_dict(), "is_admin": is_admin(user)}
 
     # ── Home, configuration, service control ──────────────────────────────
     @app.get("/")
     async def home(request: Request):
-        """Landing page after sign-in: buttons to the reports, the
-        configuration page and the service switch."""
-        if current_user(request) is None:
-            return RedirectResponse("/login?next=/", status_code=303)
+        """The admin console: links to the configuration page and the review
+        service switch. Everyone else is sent to the reports, which is all
+        they can use — the signed-out to the login form first."""
+        user = current_user(request)
+        if user is None:
+            return RedirectResponse("/login?next=/dashboard", status_code=303)
+        if not is_admin(user):
+            return RedirectResponse("/dashboard", status_code=303)
         return FileResponse(_STATIC_DIR / "home.html")
 
     @app.get("/config")
@@ -383,7 +441,7 @@ def create_app() -> FastAPI:
         if user is None:
             return RedirectResponse("/login?next=/config", status_code=303)
         if not is_admin(user):
-            return RedirectResponse("/?reason=admin", status_code=303)
+            return RedirectResponse("/dashboard", status_code=303)
         return FileResponse(_STATIC_DIR / "config.html")
 
     @app.get("/api/config")
@@ -419,10 +477,10 @@ def create_app() -> FastAPI:
         return await _apply_config(list(envconfig.FIELDS))
 
     @app.get("/api/service")
-    async def service_status(user: AuthUser = Depends(require_user)):
+    async def service_status(user: AuthUser = Depends(require_admin)):
         running = [p for p in _reviews.values() if p.status == "running"]
         return {**service.as_dict(), "running_reviews": len(running),
-                "can_control": is_admin(user)}
+                "can_control": True}
 
     @app.post("/api/service/stop")
     async def service_stop(user: AuthUser = Depends(require_admin)):
@@ -506,9 +564,10 @@ def create_app() -> FastAPI:
     async def clear_stale_note(instance: str, project_id: str, mr_iid: int,
                                user: AuthUser = Depends(require_user)):
         """
-        Force-delete a dangling "review in progress" note right now, without
-        waiting for the next push to this MR to auto-clean it (see
-        delete_stale_progress_notes() in _run_review). Refuses while this
+        Mark a dangling "review in progress" note as interrupted right now,
+        without waiting for the next push to this MR to do it (see
+        retire_progress_notes() in _run_review). The note is edited, never
+        deleted — this agent sends no deletes to GitLab. Refuses while this
         process itself still thinks a review is running for this MR — that's
         very likely just a slow review, not a stuck one; check
         /review/status or the service logs first.
@@ -524,8 +583,8 @@ def create_app() -> FastAPI:
             gitlab = get_gitlab_client(instance)
         except UnknownGitLabInstance as exc:
             raise HTTPException(status_code=404, detail=str(exc))
-        deleted = await gitlab.delete_stale_progress_notes(project_id, mr_iid)
-        return {"deleted": deleted}
+        retired = await gitlab.retire_progress_notes(project_id, mr_iid)
+        return {"retired": retired}
 
     # ── Dashboard ─────────────────────────────────────────────────────────
     @app.get("/dashboard")
@@ -722,29 +781,23 @@ async def _apply_config(changed: list[str]) -> dict:
 async def _announce_cancellation(instance: str, project_id: str | int, mr_iid: int,
                                  p: Optional[ReviewProgress]) -> None:
     """
-    Replace the MR's "review in progress" placeholder with a permanent
-    "review cancelled" record.
+    Turn the MR's "review in progress" placeholder into a permanent
+    "review cancelled" record (or post one, if there's no placeholder).
 
     Runs as its own detached task, never inline in the review it reports on:
     by the time this is scheduled the review task is already unwinding under
-    CancelledError, and awaiting two GitLab round trips inside a task that is
-    being torn down is exactly how a cancellation ends up half-applied — note
-    deleted, replacement never posted.
+    CancelledError, and awaiting GitLab round trips inside a task that is
+    being torn down is exactly how a cancellation ends up half-applied.
+
+    The placeholder is found by its marker rather than by the note id the
+    review task was holding: a cancel can land while the review is still
+    queued on the semaphore, before that id was ever assigned.
     """
     try:
         gitlab = get_gitlab_client(instance)
     except UnknownGitLabInstance as exc:
         log.warning("review.cancel_note.unknown_instance", instance=instance, error=str(exc))
         return
-
-    # Find the placeholder by its marker rather than by the note id the review
-    # task was holding: a cancel can land while the review is still queued on
-    # the semaphore, before that id was ever assigned. Matching on the marker
-    # cleans up both cases the same way, and is a no-op when there's no note.
-    try:
-        await gitlab.delete_stale_progress_notes(project_id, mr_iid)
-    except Exception as exc:
-        log.warning("review.cancel_note.progress_cleanup_failed", mr=mr_iid, error=str(exc))
 
     duration_s = None
     if p and p.started_at:
@@ -754,7 +807,7 @@ async def _announce_cancellation(instance: str, project_id: str | int, mr_iid: i
             pass
 
     try:
-        await gitlab.post_cancelled_note(
+        await gitlab.announce_cancelled(
             project_id, mr_iid,
             cancelled_by=(p.cancelled_by if p else "") or "a dashboard user",
             agents_done=len(p.agents_done) if p else None,
@@ -849,6 +902,7 @@ async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_titl
     clone_dir: Optional[str] = None
     review_started_at = datetime.now()
     cancelled = False
+    model_leased = False
 
     try:
         async with _review_semaphore:
@@ -864,23 +918,23 @@ async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_titl
             cfg    = get_settings()
             gitlab = get_gitlab_client(instance)
 
-            # Clean up any "in progress" note a previous run left dangling — e.g.
-            # the process crashed/restarted mid-review, so its own try/finally
-            # cleanup below never got to run. Safe: the duplicate-check in
+            # Mark any "in progress" note a previous run left dangling as
+            # interrupted — e.g. the process crashed/restarted mid-review, so its
+            # own try/finally never got to run. Safe: the duplicate-check in
             # _register() above already guarantees no OTHER run is currently
             # active for this MR right now, so any marker note found here can
             # only be a stale leftover, never a currently-live one.
             try:
-                cleaned = await gitlab.delete_stale_progress_notes(project_id, mr_iid)
-                if cleaned:
-                    log.warning("review.stale_progress_note.cleaned", mr=mr_iid, count=cleaned)
+                retired = await gitlab.retire_progress_notes(project_id, mr_iid)
+                if retired:
+                    log.warning("review.stale_progress_note.retired", mr=mr_iid, count=retired)
             except Exception as exc:
                 log.warning("review.stale_progress_note.cleanup_failed", mr=mr_iid, error=str(exc))
 
-            # Transient "review in progress" note — gives immediate feedback on the
-            # MR while the (potentially slow, LLM-bound) review runs. Deleted once
-            # real results are ready to post; see the finally block below for the
-            # failure path, where it's also cleaned up rather than left dangling.
+            # "Review in progress" note — gives immediate feedback on the MR
+            # while the (potentially slow, LLM-bound) review runs. Edited into
+            # the summary once results are ready, or into a "failed" record by
+            # the finally block below. Never deleted.
             if cfg.post_progress_comment:
                 try:
                     progress_note_id = await gitlab.post_progress_note(project_id, mr_iid)
@@ -976,6 +1030,11 @@ async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_titl
                 repo_root_note=repo_root_note,
             )
 
+            # Only now does the review need the model — everything above is
+            # GitLab I/O and cloning, which can take a while on its own.
+            model_leased = True
+            await _acquire_model()
+
             result = await coordinator.run(
                 ctx,
                 on_agent_start=lambda agent: _on_agent_start(instance, project_id, mr_iid, agent),
@@ -987,14 +1046,9 @@ async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_titl
             report.result = result
             report.status = "success"
 
-            if progress_note_id is not None:
-                try:
-                    await gitlab.delete_mr_note(project_id, mr_iid, progress_note_id)
-                except Exception as exc:
-                    log.warning("review.progress_note.delete_failed", mr=mr_iid, error=str(exc))
-                progress_note_id = None
-
-            await gitlab.post_review(result, mr_details, get_path_map(diff))
+            await gitlab.post_review(result, mr_details, get_path_map(diff),
+                                     progress_note_id=progress_note_id)
+            progress_note_id = None  # now the summary — the finally must leave it alone
             _finish(instance, project_id, mr_iid, result.total_issues, result.critical_count,
                     result.high_count, degraded=result.degraded)
 
@@ -1008,9 +1062,8 @@ async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_titl
         report.error  = (f"Cancelled by {p.cancelled_by}" if p and p.cancelled_by
                          else "Cancelled while in progress")
         # The MR update is handed to a detached task (see _announce_cancellation)
-        # and it deletes the placeholder by marker, so the finally below must
-        # not also try to delete it by id — that would race, and the loser
-        # logs a spurious failure against a note that's already gone.
+        # and it rewrites the placeholder by marker, so the finally below must
+        # not also rewrite it by id — the two would race to set its text.
         progress_note_id = None
         _spawn_detached(_announce_cancellation(instance, project_id, mr_iid, p))
         raise
@@ -1023,20 +1076,22 @@ async def _run_review(instance: str, project_id: str | int, mr_iid: int, mr_titl
 
     finally:
         _tasks.pop(key, None)
+        if model_leased:
+            _release_model()
         if report is not None:
             report.finished_at = datetime.now()
             # Saves before it renders, and won't let a rendering failure cost
             # us the report the dashboard reads — see ExecutionReport.
             report.persist_and_render()
 
-        # Also cleaned up on the failure path (coordinator/post_review raised)
-        # so a botched review doesn't leave the placeholder note dangling.
-        # Skipped when cancelled: awaiting GitLab inside a task that's already
-        # unwinding is unreliable, so _announce_cancellation owns it instead.
+        # Failure path (coordinator/post_review raised): the placeholder must
+        # not keep claiming the review is running, so it becomes a "failed"
+        # record. Skipped when cancelled: awaiting GitLab inside a task that's
+        # already unwinding is unreliable, so _announce_cancellation owns it.
         if progress_note_id is not None and gitlab is not None and not cancelled:
             try:
-                await gitlab.delete_mr_note(project_id, mr_iid, progress_note_id)
+                await gitlab.update_mr_note(project_id, mr_iid, progress_note_id, failed_note_body())
             except Exception as exc:
-                log.warning("review.progress_note.delete_failed", mr=mr_iid, error=str(exc))
+                log.warning("review.progress_note.update_failed", mr=mr_iid, error=str(exc))
         if clone_dir:
             shutil.rmtree(clone_dir, ignore_errors=True)

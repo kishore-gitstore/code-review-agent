@@ -12,8 +12,8 @@ So the guarantees under test are:
 
   * cancelling actually interrupts the pipeline (it isn't a flag the LLM call
     gets to ignore for another four minutes);
-  * the placeholder note is removed and replaced with a permanent record
-    naming who cancelled it;
+  * the placeholder note is turned into a permanent record naming who
+    cancelled it (edited in place — the agent never deletes anything);
   * the saved report says "cancelled", not "success with zero findings";
   * and cancelling something that isn't running is refused rather than
     silently reported as done.
@@ -35,10 +35,10 @@ KEY = server._rkey(INSTANCE, PROJECT, MR)
 def _fake_gitlab() -> MagicMock:
     """A GitLab client that answers everything _run_review asks of it."""
     g = MagicMock()
-    g.delete_stale_progress_notes = AsyncMock(return_value=0)
+    g.retire_progress_notes = AsyncMock(return_value=0)
     g.post_progress_note = AsyncMock(return_value=555)
-    g.delete_mr_note = AsyncMock(return_value=None)
-    g.post_cancelled_note = AsyncMock(return_value=556)
+    g.update_mr_note = AsyncMock(return_value=None)
+    g.announce_cancelled = AsyncMock(return_value=None)
     g.post_review = AsyncMock(return_value=None)
     g.get_mr_details = AsyncMock(return_value={
         "title": "Add checkout", "description": "", "source_branch": "feat/checkout",
@@ -122,13 +122,38 @@ async def test_cancelling_stops_the_pipeline_and_records_it_on_the_merge_request
     assert progress.finished_at is not None
     assert progress.agents_running == []
 
-    # The placeholder is gone and a permanent record took its place.
-    assert gitlab.delete_stale_progress_notes.await_count >= 1
-    gitlab.post_cancelled_note.assert_awaited_once()
-    assert gitlab.post_cancelled_note.await_args.kwargs["cancelled_by"] == "Alice Admin"
+    # The placeholder became a permanent record naming who cancelled it.
+    gitlab.announce_cancelled.assert_awaited_once()
+    assert gitlab.announce_cancelled.await_args.kwargs["cancelled_by"] == "Alice Admin"
+    # The review task itself didn't also rewrite the placeholder (as "failed").
+    gitlab.update_mr_note.assert_not_awaited()
 
     # And nothing was posted as if it were a finished review.
     gitlab.post_review.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_review_still_unloads_the_model(_no_real_model_loading):
+    llm = _no_real_model_loading
+    gitlab = _fake_gitlab()
+    running = asyncio.Event()
+
+    async def never_finishes(ctx, **callbacks):
+        running.set()
+        await asyncio.sleep(3600)
+
+    with patch("app.server.get_gitlab_client", return_value=gitlab), \
+         patch("app.server.CoordinatorAgent", _stub_coordinator(never_finishes)):
+        task = asyncio.create_task(server._run_review_bg(INSTANCE, PROJECT, MR, ""))
+        await asyncio.wait_for(running.wait(), timeout=5)
+        llm.load.assert_awaited_once()
+        server._tasks[KEY].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _drain_detached()
+
+    llm.unload.assert_awaited_once()
+    assert server._model_leases == 0
 
 
 @pytest.mark.asyncio
@@ -190,7 +215,7 @@ async def test_cancelling_before_the_review_starts_still_records_it(tmp_path):
 
     assert server._reviews[KEY].status == "cancelled"
     gitlab.get_mr_details.assert_not_awaited()      # never got as far as GitLab
-    gitlab.post_cancelled_note.assert_awaited_once()
+    gitlab.announce_cancelled.assert_awaited_once()
     assert len(list(tmp_path.glob("review_*.json"))) == 1
 
 
@@ -324,14 +349,16 @@ async def test_the_cancellation_note_says_the_mr_was_not_reviewed():
     from app.gitlab.client import CANCELLED_NOTE_MARKER, GitLabClient
 
     client = GitLabClient.__new__(GitLabClient)
+    client.retire_progress_notes = AsyncMock(return_value=0)   # no placeholder on the MR
     client.post_mr_note = AsyncMock(return_value=1)
 
-    await client.post_cancelled_note(
+    await client.announce_cancelled(
         "group/payments-api", 418, cancelled_by="Alice Admin",
         agents_done=1, agents_total=4, duration_s=95,
     )
 
     body = client.post_mr_note.await_args.args[2]
+    assert client.retire_progress_notes.await_args.args[2] == body
     assert body.startswith(CANCELLED_NOTE_MARKER)
     assert "no findings were posted" in body.lower()
     assert "not reviewed" in body.lower()
@@ -341,9 +368,23 @@ async def test_the_cancellation_note_says_the_mr_was_not_reviewed():
 
 
 @pytest.mark.asyncio
+async def test_the_placeholder_is_edited_into_the_cancellation_note_not_reposted():
+    from app.gitlab.client import CANCELLED_NOTE_MARKER, GitLabClient
+
+    client = GitLabClient.__new__(GitLabClient)
+    client.retire_progress_notes = AsyncMock(return_value=1)
+    client.post_mr_note = AsyncMock(return_value=1)
+
+    await client.announce_cancelled("group/payments-api", 418, cancelled_by="Alice Admin")
+
+    assert client.retire_progress_notes.await_args.args[2].startswith(CANCELLED_NOTE_MARKER)
+    client.post_mr_note.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_the_cancellation_note_is_not_swept_away_by_the_next_run():
-    """delete_stale_progress_notes() matches the progress marker by prefix. If
-    the cancelled note shared it, the next review would quietly erase the
+    """retire_progress_notes() matches the progress marker by prefix. If
+    the cancelled note shared it, the next review would quietly overwrite the
     audit trail it exists to leave."""
     from app.gitlab.client import CANCELLED_NOTE_MARKER, PROGRESS_NOTE_MARKER, GitLabClient
 
@@ -352,12 +393,12 @@ async def test_the_cancellation_note_is_not_swept_away_by_the_next_run():
         {"id": 1, "body": f"{PROGRESS_NOTE_MARKER}\n\nplaceholder"},
         {"id": 2, "body": f"{CANCELLED_NOTE_MARKER}\n\nrecord"},
     ])
-    client.delete_mr_note = AsyncMock(return_value=None)
+    client.update_mr_note = AsyncMock(return_value=None)
 
-    deleted = await client.delete_stale_progress_notes("group/payments-api", 418)
+    retired = await client.retire_progress_notes("group/payments-api", 418)
 
-    assert deleted == 1
-    assert client.delete_mr_note.await_args.args[2] == 1
+    assert retired == 1
+    assert client.update_mr_note.await_args.args[2] == 1
 
 
 # ── cancellation must not be retried ────────────────────────────────────────
@@ -393,7 +434,8 @@ async def test_a_cancelled_llm_request_is_not_retried(module_name, class_name, m
 
     monkeypatch.setattr(module.httpx, "AsyncClient", _Cancelling)
     for attr, value in (("model", "m"), ("base_url", "http://x"), ("api_key", "k"),
-                        ("token", "k"), ("timeout", 5), ("_semaphore", asyncio.Semaphore(1))):
+                        ("token", "k"), ("timeout", 5), ("keep_alive", "10m"),
+                        ("_semaphore", asyncio.Semaphore(1))):
         if not hasattr(client, attr):
             try:
                 setattr(client, attr, value)

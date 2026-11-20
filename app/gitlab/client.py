@@ -27,15 +27,58 @@ class UnknownGitLabInstance(Exception):
         self.instance = instance
 
 # Marker prefix for the transient "review in progress" note (see
-# post_progress_note/delete_stale_progress_notes) — a shared constant so the
+# post_progress_note/retire_progress_notes) — a shared constant so the
 # text posted and the text matched during cleanup can't drift apart.
 PROGRESS_NOTE_MARKER = "🔄 **Automated code review in progress…**"
 
-# Marker prefix for the permanent "review cancelled" note. Deliberately NOT a
-# string starting with PROGRESS_NOTE_MARKER: delete_stale_progress_notes()
-# matches on that prefix, and a cancellation record the next run silently
-# deleted would defeat the point of leaving an audit trail on the MR.
-CANCELLED_NOTE_MARKER = "🛑 **Automated code review cancelled**"
+# Markers for what a progress note turns into when the review it announced
+# ends without results. Deliberately NOT strings starting with
+# PROGRESS_NOTE_MARKER: retire_progress_notes() matches on that prefix, and a
+# record the next run silently overwrote would defeat the point of leaving an
+# audit trail on the MR.
+CANCELLED_NOTE_MARKER   = "🛑 **Automated code review cancelled**"
+FAILED_NOTE_MARKER      = "❌ **Automated code review failed**"
+INTERRUPTED_NOTE_MARKER = "⚠️ **Automated code review interrupted**"
+
+
+class ForbiddenGitLabRequest(RuntimeError):
+    """A request the agent must never send — see _guard_request."""
+
+
+# The complete list of things this agent may change on GitLab. Anything else
+# — above all a DELETE, or a write aimed at the merge request itself — is
+# refused before it leaves the process. The agent sends NO deletes at all:
+# notes it no longer needs are edited into their final form instead.
+_ALLOWED_WRITES = {
+    "POST": re.compile(r"/merge_requests/\d+/(notes|discussions)$"),
+    "PUT":  re.compile(r"/merge_requests/\d+/notes/\d+$"),
+}
+
+
+async def _guard_request(request: httpx.Request) -> None:
+    """httpx request hook installed on every GitLab client (see _http).
+
+    Enforced at the transport level rather than trusted to each call site, so
+    a future method that builds a URL wrong — or a refactor that drops a
+    /notes/{id} tail — fails loudly here instead of reaching GitLab's
+    "delete/close this merge request" endpoints.
+    """
+    method = request.method.upper()
+    if method in ("GET", "HEAD"):
+        return
+    path = request.url.path.rstrip("/")
+    allowed = _ALLOWED_WRITES.get(method)
+    if allowed is None or not allowed.search(path):
+        log.error("gitlab.request.blocked", method=method, path=path)
+        raise ForbiddenGitLabRequest(
+            f"refusing to send {method} {path}: the review agent only adds or edits "
+            "its own merge-request notes and never deletes anything"
+        )
+
+
+def _http(timeout: float) -> httpx.AsyncClient:
+    """The only way this module talks to GitLab — every client carries the guard."""
+    return httpx.AsyncClient(timeout=timeout, event_hooks={"request": [_guard_request]})
 
 _EMOJI = {
     Severity.critical: "🔴",
@@ -65,7 +108,7 @@ class GitLabClient:
 
     async def get_mr_details(self, project_id: str | int, mr_iid: int) -> dict:
         url = f"{self.base_url}/projects/{_enc(project_id)}/merge_requests/{mr_iid}"
-        async with httpx.AsyncClient(timeout=20) as c:
+        async with _http(20) as c:
             r = await c.get(url, headers=self.headers)
             r.raise_for_status()
         return r.json()
@@ -73,7 +116,7 @@ class GitLabClient:
     async def get_mr_diff(self, project_id: str | int, mr_iid: int) -> str:
         """Return the unified diff for an MR (all changes, all files)."""
         url = f"{self.base_url}/projects/{_enc(project_id)}/merge_requests/{mr_iid}/changes"
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _http(30) as client:
             r = await client.get(url, headers=self.headers)
             r.raise_for_status()
 
@@ -87,7 +130,7 @@ class GitLabClient:
 
     async def get_project(self, project_id: str | int) -> dict:
         url = f"{self.base_url}/projects/{_enc(project_id)}"
-        async with httpx.AsyncClient(timeout=20) as c:
+        async with _http(20) as c:
             r = await c.get(url, headers=self.headers)
             r.raise_for_status()
         return r.json()
@@ -159,7 +202,7 @@ class GitLabClient:
         fetched = 0
         errors: list[str] = []
 
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with _http(20) as client:
             for path in changed_files:
                 url = f"{self.base_url}/projects/{_enc(project_id)}/repository/files/{quote(path, safe='')}/raw"
                 try:
@@ -189,48 +232,61 @@ class GitLabClient:
 
     async def post_mr_note(self, project_id: str | int, mr_iid: int, body: str) -> int | None:
         """Post a top-level (general) comment on the MR. Returns the new note's id
-        (needed to later delete a transient note, e.g. a "review in progress" placeholder)."""
+        (needed to later edit a transient note, e.g. the "review in progress"
+        placeholder, into its final form)."""
         url = f"{self.base_url}/projects/{_enc(project_id)}/merge_requests/{mr_iid}/notes"
-        async with httpx.AsyncClient(timeout=20) as c:
+        async with _http(20) as c:
             r = await c.post(url, headers=self.headers, json={"body": body})
             r.raise_for_status()
         note_id = r.json().get("id")
         log.info("gitlab.note.posted", mr=mr_iid, note_id=note_id)
         return note_id
 
-    async def delete_mr_note(self, project_id: str | int, mr_iid: int, note_id: int) -> None:
-        """Delete ONE previously posted MR note (e.g. a "review in progress"
-        placeholder once the real results are ready to post).
+    async def update_mr_note(self, project_id: str | int, mr_iid: int, note_id: int, body: str) -> None:
+        """Rewrite the body of ONE note this agent posted earlier.
 
-        This is the only DELETE the agent ever sends to GitLab, and it must
-        never be able to reach the merge request itself: a URL that lost its
-        /notes/{id} tail would be GitLab's "delete this MR" endpoint. So both
-        ids must be real positive integers, and the URL is checked to still
-        be a note URL, before anything is sent.
+        This is how the agent retires its "review in progress" placeholder:
+        the note is edited into the summary (or a failed/cancelled record),
+        never deleted — the agent sends no DELETE requests at all. Both ids
+        must be real positive integers, so a missing id can't turn the URL
+        into one that addresses the merge request itself; _guard_request
+        enforces the same on the wire.
         """
         if not _is_positive_int(mr_iid) or not _is_positive_int(note_id):
             raise ValueError(
-                f"refusing to delete: mr_iid={mr_iid!r} and note_id={note_id!r} "
+                f"refusing to edit: mr_iid={mr_iid!r} and note_id={note_id!r} "
                 "must both be positive integers"
             )
         url = f"{self.base_url}/projects/{_enc(project_id)}/merge_requests/{int(mr_iid)}/notes/{int(note_id)}"
-        if not re.search(r"/merge_requests/\d+/notes/\d+$", url):
-            raise ValueError(f"refusing to delete: {url} is not a note URL")
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.delete(url, headers=self.headers)
+        async with _http(20) as c:
+            r = await c.put(url, headers=self.headers, json={"body": body})
             r.raise_for_status()
-        log.info("gitlab.note.deleted", mr=mr_iid, note_id=note_id)
+        log.info("gitlab.note.updated", mr=mr_iid, note_id=note_id)
+
+    async def update_or_post_note(self, project_id: str | int, mr_iid: int,
+                                  note_id: int | None, body: str) -> None:
+        """Edit `note_id` into `body`; post `body` as a new note if there is no
+        note to edit, or the edit fails (e.g. someone removed the placeholder
+        by hand). Either way the MR ends up carrying `body` exactly once."""
+        if note_id is not None:
+            try:
+                await self.update_mr_note(project_id, mr_iid, note_id, body)
+                return
+            except Exception as exc:
+                log.warning("gitlab.note.update_failed_posting_new", mr=mr_iid,
+                            note_id=note_id, error=str(exc))
+        await self.post_mr_note(project_id, mr_iid, body)
 
     async def post_progress_note(self, project_id: str | int, mr_iid: int) -> int | None:
         """Post the transient "review in progress" placeholder — always the
-        same marked body, so delete_stale_progress_notes() can reliably find
-        and clean up one left behind by a crashed/killed previous run."""
+        same marked body, so retire_progress_notes() can reliably find one
+        left behind by a crashed/killed previous run."""
         return await self.post_mr_note(
             project_id, mr_iid,
-            f"{PROGRESS_NOTE_MARKER}\n\nThis comment will be replaced once the review completes.",
+            f"{PROGRESS_NOTE_MARKER}\n\nThis comment will be updated once the review completes.",
         )
 
-    async def post_cancelled_note(
+    async def announce_cancelled(
         self,
         project_id:   str | int,
         mr_iid:       int,
@@ -238,41 +294,26 @@ class GitLabClient:
         agents_done:  int | None = None,
         agents_total: int | None = None,
         duration_s:   float | None = None,
-    ) -> int | None:
+    ) -> None:
         """
-        Post the permanent record that a review was stopped mid-flight.
+        Leave the permanent record that a review was stopped mid-flight.
 
-        This replaces the transient progress note rather than editing it, so
-        the MR keeps a dated entry in its discussion history that a later run
-        won't clean up. The wording leads with "no findings were posted"
-        because the dangerous reading of a silent review is "the bot looked
-        and found nothing" — a cancelled review is an absence of evidence,
-        not evidence of absence.
+        The "review in progress" placeholder is found by its marker and
+        edited into this record; with no placeholder on the MR (progress
+        notes are off, or the cancel landed before one was posted) the record
+        is posted as a new note. The wording leads with "no findings were
+        posted" because the dangerous reading of a silent review is "the bot
+        looked and found nothing" — a cancelled review is an absence of
+        evidence, not evidence of absence.
         """
-        rows = []
-        if cancelled_by:
-            rows.append(("Cancelled by", cancelled_by))
-        rows.append(("Cancelled at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        if duration_s is not None:
-            rows.append(("Ran for", f"{int(duration_s // 60)}m {int(duration_s % 60):02d}s"))
-        if agents_total:
-            rows.append(("Agents completed", f"{agents_done or 0} of {agents_total}"))
-
-        table = "\n".join(f"| {label} | {value} |" for label, value in rows)
-        body = (
-            f"{CANCELLED_NOTE_MARKER}\n\n"
-            "This merge request's automated review was stopped before it finished, so "
-            "**no findings were posted**. Treat this MR as *not reviewed* — not as approved.\n\n"
-            "| | |\n|---|---|\n"
-            f"{table}\n\n"
-            "Push a new commit to this branch, or re-trigger the review, to run it again."
-        )
-        return await self.post_mr_note(project_id, mr_iid, body)
+        body = cancelled_note_body(cancelled_by, agents_done, agents_total, duration_s)
+        if await self.retire_progress_notes(project_id, mr_iid, body) == 0:
+            await self.post_mr_note(project_id, mr_iid, body)
 
     async def _own_username(self) -> str:
         """Username the configured token authenticates as (cached)."""
         if getattr(self, "_own_name", None) is None:
-            async with httpx.AsyncClient(timeout=20) as c:
+            async with _http(20) as c:
                 r = await c.get(f"{self.base_url}/user", headers=self.headers)
                 r.raise_for_status()
             self._own_name = str(r.json().get("username", ""))
@@ -280,19 +321,22 @@ class GitLabClient:
 
     async def list_mr_notes(self, project_id: str | int, mr_iid: int) -> list[dict]:
         url = f"{self.base_url}/projects/{_enc(project_id)}/merge_requests/{mr_iid}/notes"
-        async with httpx.AsyncClient(timeout=20) as c:
+        async with _http(20) as c:
             r = await c.get(url, headers=self.headers, params={"per_page": 100})
             r.raise_for_status()
         return r.json()
 
-    async def delete_stale_progress_notes(self, project_id: str | int, mr_iid: int) -> int:
+    async def retire_progress_notes(self, project_id: str | int, mr_iid: int,
+                                    body: str | None = None) -> int:
         """
-        Find and delete any leftover "review in progress" note on this MR —
-        recovery for when a previous run posted one and then never got to
-        delete it (process crashed/restarted mid-review, so its own
-        try/finally cleanup never ran). Safe to call even when there's no
-        stale note: returns 0 and does nothing.
+        Edit every "review in progress" note this agent left on the MR into
+        `body` (default: an "interrupted" record). Recovery for when a previous
+        run posted one and never got to finish it (process crashed/restarted
+        mid-review), and the way a cancellation marks its own placeholder.
+        Nothing is deleted. Safe to call when there's no such note: returns 0
+        and does nothing.
         """
+        body = body or interrupted_note_body()
         try:
             notes = await self.list_mr_notes(project_id, mr_iid)
         except Exception as exc:
@@ -302,7 +346,7 @@ class GitLabClient:
         # Only our OWN, user-visible progress placeholders. A bare prefix match
         # isn't enough: a person quoting the placeholder in a reply, or a
         # system note, would be swept up with it. Fail closed — if we can't
-        # establish who the token belongs to, delete nothing.
+        # establish who the token belongs to, touch nothing.
         candidates = [
             n for n in notes
             if str(n.get("body", "")).startswith(PROGRESS_NOTE_MARKER) and not n.get("system")
@@ -322,17 +366,17 @@ class GitLabClient:
                          note_id=n.get("id"), author=author)
                 continue
             stale.append(n)
-        deleted = 0
+        retired = 0
         for note in stale:
             try:
-                await self.delete_mr_note(project_id, mr_iid, note["id"])
-                deleted += 1
+                await self.update_mr_note(project_id, mr_iid, note["id"], body)
+                retired += 1
             except Exception as exc:
-                log.warning("gitlab.stale_progress_notes.delete_failed",
+                log.warning("gitlab.stale_progress_notes.update_failed",
                             mr=mr_iid, note_id=note.get("id"), error=str(exc))
-        if deleted:
-            log.info("gitlab.stale_progress_notes.cleaned", mr=mr_iid, count=deleted)
-        return deleted
+        if retired:
+            log.info("gitlab.stale_progress_notes.retired", mr=mr_iid, count=retired)
+        return retired
 
     async def post_inline_comment(
         self,
@@ -369,7 +413,7 @@ class GitLabClient:
             f"/merge_requests/{mr_iid}/discussions"
         )
         try:
-            async with httpx.AsyncClient(timeout=20) as c:
+            async with _http(20) as c:
                 r = await c.post(url, headers=self.headers, json=payload)
                 r.raise_for_status()
             log.debug("gitlab.inline.posted", file=comment.file_path, line=comment.line)
@@ -388,7 +432,12 @@ class GitLabClient:
         result: ReviewResult,
         mr_details: dict,
         path_map: dict[str, str] | None = None,
+        progress_note_id: int | None = None,
     ) -> None:
+        """Post the inline findings, then turn the "review in progress"
+        placeholder (`progress_note_id`, if one was posted) into the summary.
+        The placeholder is edited, not deleted and re-posted — see
+        _guard_request for why this agent never deletes anything."""
         cfg       = get_settings()
         diff_refs = mr_details.get("diff_refs") or {}
         base_sha  = diff_refs.get("base_sha",  "")
@@ -413,7 +462,15 @@ class GitLabClient:
         # 2. Summary comment (always includes anything that couldn't go inline)
         if cfg.post_summary_comment:
             body = _build_summary(result, failed_inline)
-            await self.post_mr_note(result.project_id, result.mr_iid, body)
+            await self.update_or_post_note(result.project_id, result.mr_iid, progress_note_id, body)
+        elif progress_note_id is not None:
+            # No summary wanted, but the placeholder must not keep claiming
+            # the review is still running.
+            await self.update_or_post_note(
+                result.project_id, result.mr_iid, progress_note_id,
+                f"✅ **Automated code review complete** — {result.total_issues} finding(s), "
+                "posted as inline comments.",
+            )
 
     # ── Webhook verification ──────────────────────────────────────────────
 
@@ -421,6 +478,53 @@ class GitLabClient:
         if not self._webhook_secret:
             return True
         return hmac.compare_digest(self._webhook_secret, token_header)
+
+
+# ── Note bodies ───────────────────────────────────────────────────────────────
+
+def _stamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def cancelled_note_body(cancelled_by: str = "", agents_done: int | None = None,
+                        agents_total: int | None = None, duration_s: float | None = None) -> str:
+    rows = []
+    if cancelled_by:
+        rows.append(("Cancelled by", cancelled_by))
+    rows.append(("Cancelled at", _stamp()))
+    if duration_s is not None:
+        rows.append(("Ran for", f"{int(duration_s // 60)}m {int(duration_s % 60):02d}s"))
+    if agents_total:
+        rows.append(("Agents completed", f"{agents_done or 0} of {agents_total}"))
+    table = "\n".join(f"| {label} | {value} |" for label, value in rows)
+    return (
+        f"{CANCELLED_NOTE_MARKER}\n\n"
+        "This merge request's automated review was stopped before it finished, so "
+        "**no findings were posted**. Treat this MR as *not reviewed* — not as approved.\n\n"
+        "| | |\n|---|---|\n"
+        f"{table}\n\n"
+        "Push a new commit to this branch, or re-trigger the review, to run it again."
+    )
+
+
+def failed_note_body() -> str:
+    # The exception text stays in the service log and the dashboard report:
+    # it can carry internal hostnames and paths that don't belong on an MR.
+    return (
+        f"{FAILED_NOTE_MARKER}\n\n"
+        f"The automated review hit an error at {_stamp()} before it could post its results, "
+        "so **this MR has not been reviewed**. An administrator can see the cause on the "
+        "review dashboard. Push a new commit, or re-trigger the review, to try again."
+    )
+
+
+def interrupted_note_body() -> str:
+    return (
+        f"{INTERRUPTED_NOTE_MARKER}\n\n"
+        "An earlier review run on this MR stopped before it finished (the service was "
+        f"restarted or crashed); noticed at {_stamp()}. That run posted no summary. "
+        "A newer review, if one is running, will post its own results."
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

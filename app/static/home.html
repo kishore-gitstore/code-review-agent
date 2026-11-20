@@ -111,13 +111,14 @@ let busy = false;
 async function api(url, opts) {
   const res = await fetch(url, Object.assign({ credentials: "same-origin" }, opts || {}));
   if (res.status === 401) { location.replace("/login?reason=expired&next=/"); }
+  if (res.status === 403) { location.replace("/dashboard"); }
   return res;
 }
 
 async function loadMe() {
   const res = await api("/api/me"); if (!res.ok) return;
   const me = await res.json();
-  if (me.auth_enabled && me.user) {
+  if (me.user) {
     $("#who").textContent = me.user.display_name || me.user.username;
     $("#signout").hidden = false;
   }

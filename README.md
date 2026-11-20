@@ -493,11 +493,13 @@ Open `http://<host>:8000/dashboard` for a live view of everything the agent has
 reviewed. It is a single self-contained page (no CDN or external calls, so it
 works on an air-gapped server) fed by `/api/reports` and `/review/active`.
 
-**Sign-in is required** — see [Dashboard Login](#dashboard-login-active-directory)
+**Sign-in is always required** — see [Dashboard Login](#dashboard-login-local-accounts-and-active-directory)
 below. Reports quote real source lines out of private repositories, so the
-dashboard, the report APIs and the control endpoints all sit behind an Active
-Directory session. GitLab webhooks do not (they can't hold one; they keep
-authenticating with their own `webhook_secret`).
+dashboard, the report APIs and the control endpoints all sit behind a session
+(local account or Active Directory). GitLab webhooks do not (they can't hold
+one; they keep authenticating with their own `webhook_secret`). After signing
+in, everyone lands on the dashboard; the home page (the review-service switch)
+and the configuration page are for administrators only.
 
 - **Filters in one row** — date range (24h / 7d / 30d / 90d / all), GitLab
   instance, project, status and free-text search. Every figure, chart and table
@@ -516,7 +518,7 @@ authenticating with their own `webhook_secret`).
 - **Cancel a running review** — every in-progress row carries a **Cancel**
   button (also in the live detail panel). It interrupts the pipeline
   immediately, mid-LLM-call if need be, and then updates the merge request:
-  the transient *review in progress* note is replaced with a permanent
+  the *review in progress* note is edited into a permanent
   *review cancelled* record naming who cancelled it, how far it got, and
   stating plainly that no findings were posted — so a stopped review can't
   be mistaken for a clean one. The review is saved to `reports/` with status
@@ -535,7 +537,31 @@ database — delete a file and it disappears from the dashboard.
 
 ---
 
-## Dashboard Login (Active Directory)
+## Dashboard Login (local accounts and Active Directory)
+
+Sign-in cannot be switched off (the old `AUTH_ENABLED=false` made every
+visitor an anonymous administrator, and is now ignored). Two account sources,
+usable together:
+
+### Local accounts
+
+Kept in `.env` as `LOCAL_USERS` — usernames with salted PBKDF2-SHA256 hashes,
+never clear-text passwords. Manage them on the server:
+
+```bash
+python -m app.auth.local_users add admin --admin   # prompts for the password; --admin also adds to ADMIN_USERS
+python -m app.auth.local_users add alice           # a read-only dashboard user
+python -m app.auth.local_users list
+python -m app.auth.local_users remove alice
+```
+
+Restart the service afterwards. A local username is checked against its local
+password only — it never falls through to AD — so an AD account that happens
+to share the name can't sign in as it. With neither `LOCAL_USERS` nor
+`LDAP_SERVER` set, nobody can sign in; the service logs
+`auth.no_sign_in_method` at startup with the command above.
+
+### Active Directory
 
 The dashboard authenticates against your existing AD by **binding as the user**:
 the username and password typed into the login form are used to open an LDAP
@@ -543,7 +569,6 @@ connection to a domain controller. If AD accepts them the password is correct,
 which means no service account is needed and no password is ever stored here.
 
 ```ini
-AUTH_ENABLED=true
 LDAP_SERVER=ldaps://dc01.corp.local     # ldaps:// forces TLS whatever LDAP_USE_SSL says
 LDAP_DOMAIN=corp.local                  # turns "alice" into "alice@corp.local" for the bind
 LDAP_BASE_DN=DC=corp,DC=local           # optional: display name + group membership
@@ -570,17 +595,34 @@ Notes:
 - **Scripts and CI** that trigger reviews without a browser can send
   `X-API-Token: <DASHBOARD_API_TOKEN>` instead of signing in. Empty (the
   default) disables that path entirely.
-- **`AUTH_ENABLED=false`** leaves the dashboard open to anyone who can reach
-  the port. Dev boxes only.
+- **Administrators** are the usernames in `ADMIN_USERS` (local or AD) plus
+  members of the AD group `ADMIN_GROUP`. Both empty = nobody is an admin.
 
 What each caller may reach:
 
 | Endpoint | Who |
 |---|---|
-| `/dashboard`, `/api/reports*`, `/review/active`, `/review/status/...` | signed-in AD user |
-| `POST /review`, `POST /review/.../cancel`, `.../clear-stale-note` | signed-in AD user (or `X-API-Token`) |
+| `/dashboard`, `/api/reports*`, `/review/active`, `/review/status/...` | any signed-in user |
+| `POST /review`, `POST /review/.../cancel`, `.../clear-stale-note` | any signed-in user (or `X-API-Token`) |
+| `/` (home), `/config`, `/api/config`, `/api/service*` | administrators only |
 | `POST /webhook/gitlab/{instance}` | GitLab, via `webhook_secret` — **not** behind the login |
 | `GET /health` | open, so load balancers and NSSM can probe it |
+
+---
+
+## What the Agent May Change on GitLab
+
+Only its own comments. Every GitLab request passes through a guard
+(`_guard_request` in `app/gitlab/client.py`) that allows reads, `POST` to an
+MR's `/notes` or `/discussions`, and `PUT` to `/notes/{id}` — and refuses
+everything else before it leaves the process, **every `DELETE` included**.
+The *review in progress* note is edited into the summary (or into a *failed*,
+*cancelled* or *interrupted* record), never deleted. A blocked request is
+logged as `gitlab.request.blocked`.
+
+For a second line of defence, give the agent a token whose user has the
+**Developer** role on the projects: GitLab only lets Owners/administrators
+delete merge requests.
 
 ---
 
@@ -607,6 +649,8 @@ already finished is refused with a **409** rather than reported as cancelled.
 | `OLLAMA_BASE_URL`         | `http://localhost:11434`    | Ollama API URL                           |
 | `OLLAMA_MODEL`            | `deepseek-coder-v2`         | Model name (must be pulled first)        |
 | `OLLAMA_TIMEOUT`          | `300`                       | Seconds before an LLM call times out — raise this if you see `ReadTimeout`/`RetryError` in the logs, larger local coder models can easily take minutes per request |
+| `OLLAMA_KEEP_ALIVE`       | `10m`                       | How long Ollama keeps the model loaded between one review's requests (`10m`, `1h`, or seconds) |
+| `OLLAMA_UNLOAD_AFTER_REVIEW` | `true`                   | Load the model when a review reaches its LLM stage and unload it as soon as no review is running, so an idle service holds no RAM/VRAM |
 | `EXECUTION_MODE`          | `auto`                      | `auto` \| `cpu` \| `gpu` — see [Execution Mode](#execution-mode-cpu--gpu) above |
 | `MAX_PARALLEL_REVIEWS`    | `1`                         | Concurrent MR reviews end-to-end (gpu/cloud mode only — forced to 1 in cpu mode) |
 | `MAX_PARALLEL_ANALYZERS`  | `1`                         | Concurrent static-analysis language groups (gpu/cloud mode only — forced to 1 in cpu mode) |
@@ -632,7 +676,7 @@ already finished is refused with a **409** rather than reported as cancelled.
 | `CLANG_TIDY_ARGS`         | `-- -std=c++17`              | Fallback compiler flags used only when no `compile_commands.json` is found under the checkout |
 | `SPOTBUGS_CMD`            | `spotbugs`                  | SpotBugs (Java) — binary name or full path |
 | `SPOTBUGS_CLASSES_DIRS`   | `target/classes,build/classes/java/main` | Comma-separated candidate build-output directories, checked in order; first one that exists is used |
-| `AUTH_ENABLED`            | `true`                      | Require an Active Directory login for the dashboard and report APIs — see [Dashboard Login](#dashboard-login-active-directory) |
+| `LOCAL_USERS`             | *(empty)*                   | Local dashboard accounts (`name:pbkdf2-hash,…`) — manage with `python -m app.auth.local_users`, see [Dashboard Login](#dashboard-login-local-accounts-and-active-directory) |
 | `LDAP_SERVER`             | *(empty)*                   | Domain controller: bare host, `host:port`, or a URL. `ldaps://` forces TLS |
 | `LDAP_PORT`               | `0`                         | `0` → 636 with SSL, 389 without |
 | `LDAP_USE_SSL`            | `true`                      | Plain LDAP sends the password in clear text |

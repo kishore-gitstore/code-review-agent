@@ -1,4 +1,4 @@
-"""Admin surface: configuration page, service switch, and the MR-note delete guards."""
+"""Admin surface: configuration page, service switch, and stale MR-note handling."""
 
 import json
 from unittest.mock import AsyncMock
@@ -93,7 +93,21 @@ def test_non_admin_is_refused(env_file):
     assert c.post("/api/service/stop").status_code == 403
     assert c.get("/config", follow_redirects=False).status_code == 303
     assert c.get("/api/me").json()["is_admin"] is False
-    assert c.get("/api/service").json()["can_control"] is False
+    # The review service's state is admin-only too, not just its switch.
+    assert c.get("/api/service").status_code == 403
+
+
+def test_a_non_admin_lands_on_the_reports_not_the_admin_home(env_file):
+    c = sign_in(TestClient(server.create_app()), TEST_USER)
+    r = c.get("/", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/dashboard"
+    r = c.get("/config", follow_redirects=False)
+    assert r.headers["location"] == "/dashboard"
+
+
+def test_an_admin_gets_the_home_page(env_file):
+    r = admin_client().get("/", follow_redirects=False)
+    assert r.status_code == 200 and "Review service" in r.text
 
 
 def test_no_admins_configured_means_nobody_is_admin(env_file, monkeypatch):
@@ -105,6 +119,7 @@ def test_anonymous_is_sent_to_login(anonymous_client):
     assert anonymous_client.get("/config", follow_redirects=False).headers["location"].startswith("/login")
     assert anonymous_client.get("/", follow_redirects=False).status_code == 303
     assert anonymous_client.get("/api/config").status_code == 401
+    assert anonymous_client.get("/api/service").status_code == 401
 
 
 def test_config_get_never_returns_secrets(env_file):
@@ -132,20 +147,13 @@ def test_stopped_service_refuses_manual_trigger_and_ignores_webhooks():
     assert c.post("/api/service/start").json()["state"] == "running"
 
 
-# ── MR deletion guards ───────────────────────────────────────────────────────
+# ── stale progress notes (edited, never deleted) ─────────────────────────────
 
 def _client():
     g = GitLabClient.__new__(GitLabClient)
     g.base_url = "https://gitlab.example.com/api/v4"
     g.headers = {}
     return g
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mr,note", [(7, None), (7, 0), (7, "42/../.."), (None, 5), (7, True), (0, 5), ("", 5)])
-async def test_delete_mr_note_refuses_ids_that_could_reach_the_mr(mr, note):
-    with pytest.raises(ValueError):
-        await _client().delete_mr_note("g/r", mr, note)
 
 
 @pytest.mark.asyncio
@@ -157,18 +165,18 @@ async def test_stale_cleanup_leaves_other_peoples_notes_alone():
         {"id": 2, "body": PROGRESS_NOTE_MARKER + " quoted", "author": {"username": "alice"}},
         {"id": 3, "body": PROGRESS_NOTE_MARKER, "author": {"username": "review-bot"}, "system": True},
     ])
-    g.delete_mr_note = AsyncMock()
-    assert await g.delete_stale_progress_notes(1, 7) == 1
-    assert [c.args[2] for c in g.delete_mr_note.await_args_list] == [1]
+    g.update_mr_note = AsyncMock()
+    assert await g.retire_progress_notes(1, 7) == 1
+    assert [c.args[2] for c in g.update_mr_note.await_args_list] == [1]
 
 
 @pytest.mark.asyncio
-async def test_stale_cleanup_deletes_nothing_if_identity_unknown():
+async def test_stale_cleanup_touches_nothing_if_identity_unknown():
     g = _client()
     g._own_name = None
     g._own_username = AsyncMock(side_effect=Exception("401"))
     g.list_mr_notes = AsyncMock(return_value=[
         {"id": 1, "body": PROGRESS_NOTE_MARKER, "author": {"username": "review-bot"}}])
-    g.delete_mr_note = AsyncMock()
-    assert await g.delete_stale_progress_notes(1, 7) == 0
-    g.delete_mr_note.assert_not_called()
+    g.update_mr_note = AsyncMock()
+    assert await g.retire_progress_notes(1, 7) == 0
+    g.update_mr_note.assert_not_called()

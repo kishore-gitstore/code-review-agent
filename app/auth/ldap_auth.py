@@ -61,8 +61,8 @@ def _build_server() -> Server:
     cfg = get_settings()
     if not cfg.ldap_server:
         raise AuthConfigError(
-            "LDAP_SERVER is not set — set it in .env, or set AUTH_ENABLED=false "
-            "to run the dashboard without a login."
+            "LDAP_SERVER is not set — set it in .env, or add a local account with "
+            "`python -m app.auth.local_users add <name>`."
         )
     use_ssl = cfg.ldap_use_ssl
     host, port, ssl_override = _split_host_port(

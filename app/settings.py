@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     ollama_base_url: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
     ollama_model: str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
     ollama_timeout: int = 300  # local coder models can easily take minutes per request
+    # The model is loaded when a review reaches its LLM stage and, with
+    # ollama_unload_after_review on, unloaded as soon as the last running
+    # review finishes — so an idle service holds no RAM/VRAM. keep_alive is
+    # how long Ollama keeps it between one review's requests (and the
+    # fallback if an unload request is ever lost). "10m", "1h", or seconds.
+    ollama_keep_alive: str = "10m"
+    ollama_unload_after_review: bool = True
 
     # GitLab — one or more instances, keyed by a short name of your choosing.
     # That name appears in the webhook URL (/webhook/gitlab/{name}) and in the
@@ -57,7 +64,7 @@ class Settings(BaseSettings):
     # the MR author a one-click "Apply suggestion" button that commits it.
     # Off → the fix is shown as a plain read-only code block instead.
     post_fix_suggestions: bool = True
-    post_progress_comment: bool = True  # transient "review in progress" note, deleted once the review completes
+    post_progress_comment: bool = True  # "review in progress" note, edited into the summary once the review completes
 
     # Review agents
     enable_code_quality: bool = True
@@ -92,15 +99,18 @@ class Settings(BaseSettings):
     app_port: int = 8000
     log_level: str = "INFO"
 
-    # ── Dashboard authentication (Active Directory over LDAP) ──────────────
-    # Guards the reporting surface only: the dashboard page, the report APIs,
-    # and the endpoints that start or cancel a review. GitLab webhooks are
-    # NOT covered — they authenticate with their own shared secret, and
-    # putting a login in front of them would break every hook.
+    # ── Dashboard sign-in (local accounts and/or Active Directory) ─────────
+    # Always on — there is no switch to open the dashboard to anyone who can
+    # reach the port. Guards the dashboard, the report APIs, and the
+    # endpoints that start or cancel a review. GitLab webhooks are NOT
+    # covered — they authenticate with their own shared secret, and putting a
+    # login in front of them would break every hook. (An old AUTH_ENABLED
+    # line in .env is ignored.)
     #
-    # false leaves the dashboard open to anyone who can reach the port; keep
-    # it that way only on a dev box.
-    auth_enabled: bool = True
+    # Local accounts: "name:pbkdf2-hash,…" — manage them with
+    #   python -m app.auth.local_users add <name> [--admin]
+    # rather than by hand. Checked before AD; see app/auth/login.py.
+    local_users: str = ""
 
     # Domain controller to bind against. Bare host, host:port, or a URL —
     # ldaps://dc01.corp.local forces TLS regardless of ldap_use_ssl.
@@ -128,11 +138,10 @@ class Settings(BaseSettings):
     # a full DN also matches nested groups via AD's LDAP_MATCHING_RULE_IN_CHAIN.
     ldap_required_group: str = ""
 
-    # Who may open the configuration page and start/stop the review service.
-    # Either list usernames (comma-separated, case-insensitive) or name an AD
-    # group (CN). Both empty = nobody is an admin while auth is on — the safe
-    # default; the pages stay locked until you name someone. With
-    # AUTH_ENABLED=false everyone is admin, as there is no identity to check.
+    # Who may open the home page, the configuration page and start/stop the
+    # review service. Either list usernames (local or AD; comma-separated,
+    # case-insensitive) or name an AD group (CN). Both empty = nobody is an
+    # admin — the safe default; the pages stay locked until you name someone.
     admin_users: str = ""
     admin_group: str = ""
 

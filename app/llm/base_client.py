@@ -22,6 +22,14 @@ class BaseLLMClient(ABC):
         """
         ...
 
+    async def load(self) -> None:
+        """Bring the model into memory before a review's first request.
+        No-op for hosted APIs; self-hosted providers (Ollama) override it."""
+
+    async def unload(self) -> None:
+        """Release the model's memory once no review needs it. No-op for
+        hosted APIs; self-hosted providers (Ollama) override it."""
+
     @abstractmethod
     async def health_check(self) -> dict:
         """

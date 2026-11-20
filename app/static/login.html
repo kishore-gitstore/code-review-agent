@@ -74,14 +74,14 @@
 
 <form class="card" id="form" autocomplete="on">
   <h1>Code Review Agent</h1>
-  <p class="sub">Sign in with your Active Directory account to view review reports.</p>
+  <p class="sub">Sign in to view review reports.</p>
 
   <div class="msg error" id="msg" hidden role="alert"></div>
 
   <div class="field">
     <label for="username">Username</label>
     <input id="username" name="username" autocomplete="username" autocapitalize="none"
-           spellcheck="false" autofocus required placeholder="domain username">
+           spellcheck="false" autofocus required placeholder="username">
   </div>
   <div class="field">
     <label for="password">Password</label>
@@ -98,8 +98,8 @@ const msg = $("#msg"), submit = $("#submit");
 
 /* ?next= is echoed straight back into a same-origin fetch below, never into
    an href — and the server sanitizes it again before trusting it. */
-const nextUrl = new URLSearchParams(location.search).get("next") || "/";
-const safeNext = (nextUrl.startsWith("/") && !nextUrl.startsWith("//") && !nextUrl.includes("\\")) ? nextUrl : "/";
+const nextUrl = new URLSearchParams(location.search).get("next") || "/dashboard";
+const safeNext = (nextUrl.startsWith("/") && !nextUrl.startsWith("//") && !nextUrl.includes("\\")) ? nextUrl : "/dashboard";
 
 function show(text, kind) {
   msg.textContent = text;
@@ -138,10 +138,9 @@ $("#form").addEventListener("submit", async ev => {
   }
 });
 
-/* Tell the user which domain they're signing in to, when the server knows. */
+/* Tell the user which AD domain they're signing in to, when there is one. */
 fetch("/api/auth/info").then(r => r.ok ? r.json() : null).then(info => {
   if (!info) return;
-  if (!info.auth_enabled) { location.replace(safeNext); return; }
   if (info.domain) {
     $("#foot").textContent = "Domain: " + info.domain;
     $("#username").placeholder = "your " + info.domain + " username";
